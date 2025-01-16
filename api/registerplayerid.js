@@ -8,7 +8,10 @@ import fetch from 'node-fetch';
  */
 async function getTitleData(titleId, secretKey) {
     try {
-        const response = await fetch(`https://${titleId}.playfabapi.com/Server/GetTitleData`, {
+        const url = `https://${titleId}.playfabapi.com/Server/GetTitleData`;
+        console.log(`Making PlayFab API call to: ${url}`);
+        
+        const response = await fetch(url, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
@@ -20,6 +23,11 @@ async function getTitleData(titleId, secretKey) {
         });
 
         const data = await response.json();
+        console.log('PlayFab GetTitleData response:', {
+            status: response.status,
+            statusText: response.statusText,
+            data: data
+        });
         
         if (!response.ok) {
             console.error('PlayFab GetTitleData failed:', data);
@@ -41,7 +49,10 @@ async function getTitleData(titleId, secretKey) {
  * @returns {Promise<Object>} - PlayFab API response
  */
 async function setTitleData(titleId, secretKey, mappings) {
-    const response = await fetch(`https://${titleId}.playfabapi.com/Server/SetTitleData`, {
+    const url = `https://${titleId}.playfabapi.com/Server/SetTitleData`;
+    console.log(`Making PlayFab API call to: ${url}`);
+    
+    const response = await fetch(url, {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
@@ -54,6 +65,11 @@ async function setTitleData(titleId, secretKey, mappings) {
     });
 
     const result = await response.json();
+    console.log('PlayFab SetTitleData response:', {
+        status: response.status,
+        statusText: response.statusText,
+        result: result
+    });
     
     if (!response.ok) {
         console.error('PlayFab SetTitleData failed:', result);
@@ -70,7 +86,7 @@ export default async function handler(req, res) {
         // Don't log the full secret key for security
         SECRET_KEY_START: process.env.PLAYFAB_DEV_SECRET_KEY?.substring(0, 8)
     });
-    
+
     console.log('Received ID mapping request:', req.body);
     
     try {
