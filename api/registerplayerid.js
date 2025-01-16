@@ -64,6 +64,13 @@ async function setTitleData(titleId, secretKey, mappings) {
 }
 
 export default async function handler(req, res) {
+    // Temporary debug logging
+    console.log('Current environment variables:', {
+        TITLE_ID: process.env.PLAYFAB_TITLE_ID,
+        // Don't log the full secret key for security
+        SECRET_KEY_START: process.env.PLAYFAB_DEV_SECRET_KEY?.substring(0, 8)
+    });
+    
     console.log('Received ID mapping request:', req.body);
     
     try {

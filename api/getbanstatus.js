@@ -71,6 +71,13 @@ async function getBanInfo(titleId, secretKey, playFabId) {
  * Interfaces with PlayFab to retrieve active bans for a given CustomID
  */
 export default async function handler(req, res) {
+    // Temporary debug logging
+    console.log('Current environment variables:', {
+        TITLE_ID: process.env.PLAYFAB_TITLE_ID,
+        // Don't log the full secret key for security
+        SECRET_KEY_START: process.env.PLAYFAB_DEV_SECRET_KEY?.substring(0, 8)
+    });
+    
     console.log('Received ban status request for CustomID:', req.body?.customId);
     
     try {
