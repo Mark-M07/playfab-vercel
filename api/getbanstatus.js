@@ -66,6 +66,10 @@ async function getBanInfo(titleId, secretKey, playFabId) {
         }));
 }
 
+/**
+ * API handler for checking player ban status
+ * Interfaces with PlayFab to retrieve active bans for a given CustomID
+ */
 export default async function handler(req, res) {
     console.log('Received ban status request for CustomID:', req.body?.customId);
     
