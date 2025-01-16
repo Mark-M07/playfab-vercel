@@ -1,10 +1,17 @@
+/**
+ * API Module for checking player ban status
+ * Interfaces with PlayFab to retrieve active ban information for players
+ * Requires PLAYFAB_TITLE_ID and PLAYFAB_DEV_SECRET_KEY environment variables
+ */
 import fetch from 'node-fetch';
 
 /**
  * Fetches PlayFab Title Data containing ID mappings
+ * Uses Server API to retrieve stored mappings between CustomIDs and PlayFabIDs
  * @param {string} titleId - PlayFab Title ID
  * @param {string} secretKey - PlayFab Developer Secret Key
  * @returns {Promise<Object>} - Mapping of CustomIDs to PlayFabIDs
+ * @throws {Error} If API call fails or response cannot be parsed
  */
 async function getTitleData(titleId, secretKey) {
     try {
@@ -35,10 +42,12 @@ async function getTitleData(titleId, secretKey) {
 
 /**
  * Fetches ban information for a player from PlayFab
+ * Retrieves and filters active bans for the specified player
  * @param {string} titleId - PlayFab Title ID
  * @param {string} secretKey - PlayFab Developer Secret Key
  * @param {string} playFabId - Player's PlayFab ID
- * @returns {Promise<Array>} - Array of active ban information
+ * @returns {Promise<Array>} - Array of active ban information objects containing reason, expiry, and creation dates
+ * @throws {Error} If API call fails or player cannot be found
  */
 async function getBanInfo(titleId, secretKey, playFabId) {
     const response = await fetch(`https://${titleId}.playfabapi.com/Server/GetUserBans`, {
@@ -67,17 +76,16 @@ async function getBanInfo(titleId, secretKey, playFabId) {
 }
 
 /**
- * API handler for checking player ban status
- * Interfaces with PlayFab to retrieve active bans for a given CustomID
+ * API endpoint handler for checking player ban status
+ * Expects POST request with customId in request body
+ * Returns active ban information for the specified player
+ * 
+ * @route POST /api/getbanstatus
+ * @param {Object} req - Express request object with customId in body
+ * @param {Object} res - Express response object
+ * @returns {Object} JSON response with ban status or error message
  */
 export default async function handler(req, res) {
-    // Temporary debug logging
-    console.log('Current environment variables:', {
-        TITLE_ID: process.env.PLAYFAB_TITLE_ID,
-        // Don't log the full secret key for security
-        SECRET_KEY_START: process.env.PLAYFAB_DEV_SECRET_KEY?.substring(0, 8)
-    });
-    
     console.log('Received ban status request for CustomID:', req.body?.customId);
     
     try {
