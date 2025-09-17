@@ -1,19 +1,24 @@
 /**
  * API Module for checking player ban status
  * Interfaces with PlayFab to retrieve active ban information for players
+ * Uses chunked storage system to handle large numbers of ID mappings
  * Requires PLAYFAB_TITLE_ID and PLAYFAB_DEV_SECRET_KEY environment variables
  */
 import fetch from 'node-fetch';
 
 /**
- * Fetches PlayFab Title Data containing ID mappings
- * Uses Server API to retrieve stored mappings between CustomIDs and PlayFabIDs
+ * Fetches PlayFab Title Data from chunked storage
+ * Uses first 2 characters of customId to determine chunk key
  * @param {string} titleId - PlayFab Title ID
  * @param {string} secretKey - PlayFab Developer Secret Key
- * @returns {Promise<Object>} - Mapping of CustomIDs to PlayFabIDs
- * @throws {Error} If API call fails or response cannot be parsed
+ * @param {string} customId - Custom ID to look up
+ * @returns {Promise<string|null>} - PlayFabID if found, null otherwise
+ * @throws {Error} If API call fails
  */
-async function getTitleData(titleId, secretKey) {
+async function getPlayFabIdFromChunkedStorage(titleId, secretKey, customId) {
+    // Use first 2 characters for chunk key (idChunk_00 through idChunk_99)
+    const chunkKey = `idChunk_${customId.substring(0, 2)}`;
+    
     try {
         const response = await fetch(`https://${titleId}.playfabapi.com/Server/GetTitleData`, {
             method: 'POST',
@@ -22,21 +27,27 @@ async function getTitleData(titleId, secretKey) {
                 'X-SecretKey': secretKey
             },
             body: JSON.stringify({
-                Keys: ["idMappings"]
+                Keys: [chunkKey]
             })
         });
 
         const data = await response.json();
         
         if (!response.ok) {
-            console.error('PlayFab GetTitleData failed:', data);
+            console.error(`PlayFab GetTitleData failed for chunk ${chunkKey}:`, data);
             throw new Error(`PlayFab API error: ${data.errorMessage || 'Unknown error'}`);
         }
 
-        return JSON.parse(data.data.Data.idMappings || '{}');
+        // Check if chunk exists and contains data
+        if (data.data?.Data?.[chunkKey]) {
+            const mappings = JSON.parse(data.data.Data[chunkKey]);
+            return mappings[customId] || null;
+        }
+        
+        return null;
     } catch (e) {
-        console.error('Failed to fetch or parse ID mappings:', e);
-        throw e; // Re-throw to be handled by the main error handler
+        console.error(`Failed to fetch mapping from chunk ${chunkKey}:`, e);
+        throw e;
     }
 }
 
@@ -46,8 +57,8 @@ async function getTitleData(titleId, secretKey) {
  * @param {string} titleId - PlayFab Title ID
  * @param {string} secretKey - PlayFab Developer Secret Key
  * @param {string} playFabId - Player's PlayFab ID
- * @returns {Promise<Array>} - Array of active ban information objects containing reason, expiry, and creation dates
- * @throws {Error} If API call fails or player cannot be found
+ * @returns {Promise<Array>} - Array of active ban information objects
+ * @throws {Error} If API call fails
  */
 async function getBanInfo(titleId, secretKey, playFabId) {
     const response = await fetch(`https://${titleId}.playfabapi.com/Server/GetUserBans`, {
@@ -77,8 +88,7 @@ async function getBanInfo(titleId, secretKey, playFabId) {
 
 /**
  * API endpoint handler for checking player ban status
- * Expects POST request with customId in request body
- * Returns active ban information for the specified player
+ * Uses chunked storage system to find player mappings
  * 
  * @route POST /api/getbanstatus
  * @param {Object} req - Express request object with customId in body
@@ -104,20 +114,22 @@ export default async function handler(req, res) {
             });
         }
 
-        // Get ID mapping
-        const mappings = await getTitleData(
+        // Get PlayFabID from chunked storage
+        const playFabId = await getPlayFabIdFromChunkedStorage(
             process.env.PLAYFAB_TITLE_ID, 
-            process.env.PLAYFAB_DEV_SECRET_KEY
+            process.env.PLAYFAB_DEV_SECRET_KEY,
+            customId
         );
         
-        const playFabId = mappings[customId];
         if (!playFabId) {
-            console.warn(`No PlayFabID found for CustomID: ${customId}`);
+            console.warn(`No PlayFabID found for CustomID: ${customId} in chunk idChunk_${customId.substring(0, 2)}`);
             return res.status(404).json({ 
                 success: false, 
-                error: 'Player not found' 
+                error: 'Player not found - please log in to update your account' 
             });
         }
+
+        console.log(`Found PlayFabID ${playFabId} for CustomID ${customId}`);
 
         // Get ban information
         const activeBans = await getBanInfo(
