@@ -1,0 +1,133 @@
+import fetch from 'node-fetch';
+
+/**
+ * API Module for Oculus nonce validation and PlayFab login
+ * Validates nonce, then performs secure PlayFab Server LoginWithCustomID
+ * Requires OCULUS_APP_ID, OCULUS_APP_SECRET, PLAYFAB_TITLE_ID, PLAYFAB_DEV_SECRET_KEY env vars
+ * @route POST /api/verifyoculuslogin
+ * @param {Object} req - Request with userId and nonce in body
+ * @param {Object} res - Response with session details or error
+ */
+export default async function handler(req, res) {
+    console.log('Received Oculus login request:', req.body);
+    
+    try {
+        if (req.method !== 'POST') {
+            return res.status(405).json({ 
+                success: false, 
+                error: 'Method Not Allowed' 
+            });
+        }
+
+        const { userId, nonce } = req.body;
+        if (!userId || !nonce) {
+            return res.status(400).json({ 
+                success: false, 
+                error: 'Missing userId or nonce' 
+            });
+        }
+
+        const appId = process.env.OCULUS_APP_ID;
+        const appSecret = process.env.OCULUS_APP_SECRET;
+        if (!appId || !appSecret) {
+            return res.status(500).json({ 
+                success: false, 
+                error: 'Server configuration error' 
+            });
+        }
+
+        const accessToken = `OC|${appId}|${appSecret}`;
+        const url = `https://graph.oculus.com/user_nonce_validate?nonce=${nonce}&user_id=${userId}&access_token=${accessToken}`;
+
+        const oculusResponse = await fetch(url, {
+            method: 'POST'
+        });
+
+        const oculusBody = await oculusResponse.text();
+
+        if (!oculusResponse.ok) {
+            console.error('Oculus validation failed:', oculusBody);
+            return res.status(oculusResponse.status).json({
+                success: false,
+                error: 'Oculus validation failed',
+                details: oculusBody
+            });
+        }
+
+        let oculusResult;
+        try {
+            oculusResult = JSON.parse(oculusBody);
+        } catch (e) {
+            return res.status(500).json({
+                success: false,
+                error: 'Invalid response from Oculus',
+                details: oculusBody
+            });
+        }
+
+        if (!oculusResult.is_valid) {
+            return res.status(400).json({
+                success: false,
+                error: 'Invalid nonce'
+            });
+        }
+
+        // Valid nonce: Perform PlayFab Server LoginWithCustomID
+        const titleId = process.env.PLAYFAB_TITLE_ID;
+        const secretKey = process.env.PLAYFAB_DEV_SECRET_KEY;
+        
+        if (!titleId || !secretKey) {
+            return res.status(500).json({ 
+                success: false, 
+                error: 'PlayFab configuration error' 
+            });
+        }
+
+        const playfabUrl = `https://${titleId}.playfabapi.com/Server/LoginWithCustomID`;
+        const playfabBody = JSON.stringify({
+            CustomId: userId,
+            CreateAccount: true,
+            InfoRequestParameters: {
+                GetUserAccountInfo: true,
+                GetPlayerProfile: true,
+                GetUserData: true,
+                ProfileConstraints: { ShowDisplayName: true }
+            }
+        });
+
+        const playfabResponse = await fetch(playfabUrl, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-SecretKey': secretKey
+            },
+            body: playfabBody
+        });
+
+        const playfabData = await playfabResponse.json();
+
+        if (!playfabResponse.ok) {
+            console.error('PlayFab login failed:', playfabData);
+            return res.status(playfabResponse.status).json({
+                success: false,
+                error: 'PlayFab login failed',
+                details: playfabData.errorMessage
+            });
+        }
+
+        return res.status(200).json({
+            success: true,
+            sessionTicket: playfabData.data.SessionTicket,
+            playFabId: playfabData.data.PlayFabId,
+            newlyCreated: playfabData.data.NewlyCreated,
+            infoPayload: playfabData.data.InfoResultPayload
+        });
+
+    } catch (err) {
+        console.error('Error processing Oculus login:', err);
+        return res.status(500).json({ 
+            success: false, 
+            error: 'Internal Server Error' 
+        });
+    }
+}
