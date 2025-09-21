@@ -120,7 +120,7 @@ export default async function handler(req, res) {
             sessionTicket: playfabData.data.SessionTicket,
             playFabId: playfabData.data.PlayFabId,
             newlyCreated: playfabData.data.NewlyCreated,
-            infoPayload: playfabData.data.InfoResultPayload
+            infoPayload: JSON.stringify(playfabData.data.InfoResultPayload)
         });
 
     } catch (err) {
