@@ -91,6 +91,7 @@ export default async function handler(req, res) {
                 GetUserAccountInfo: true,
                 GetPlayerProfile: true,
                 GetUserData: true,
+                GetEntityToken: true,  // Added this
                 ProfileConstraints: { ShowDisplayName: true }
             }
         });
@@ -120,13 +121,16 @@ export default async function handler(req, res) {
             sessionTicket: playfabData.data.SessionTicket,
             playFabId: playfabData.data.PlayFabId,
             newlyCreated: playfabData.data.NewlyCreated,
-            infoPayload: JSON.stringify(playfabData.data.InfoResultPayload)
+            infoPayload: JSON.stringify(playfabData.data.InfoResultPayload),
+            entityToken: playfabData.data.EntityToken.EntityToken,
+            entityId: playfabData.data.EntityToken.Entity.Id,
+            entityType: playfabData.data.EntityToken.Entity.Type
         });
 
     } catch (err) {
         console.error('Error processing Oculus login:', err);
         return res.status(500).json({ 
-            success: false, 
+            success: false,
             error: 'Internal Server Error' 
         });
     }
