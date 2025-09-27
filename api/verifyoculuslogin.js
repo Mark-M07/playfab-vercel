@@ -91,7 +91,7 @@ export default async function handler(req, res) {
                 GetUserAccountInfo: true,
                 GetPlayerProfile: true,
                 GetUserData: true,
-                GetEntityToken: true,  // Added this
+                GetEntityToken: true,
                 ProfileConstraints: { ShowDisplayName: true }
             }
         });
@@ -109,9 +109,44 @@ export default async function handler(req, res) {
 
         if (!playfabResponse.ok) {
             console.error('PlayFab login failed:', playfabData);
+            
+            // Special handling for account bans
+            if (playfabData.error === 'AccountBanned' || playfabData.errorCode === 1002) {
+                // Extract ban details
+                const banInfo = {
+                    reason: null,
+                    expiry: null
+                };
+                
+                // PlayFab returns errorDetails as an object with ban reasons as keys
+                // and expiry dates as array values
+                if (playfabData.errorDetails) {
+                    const reasons = Object.keys(playfabData.errorDetails);
+                    if (reasons.length > 0) {
+                        banInfo.reason = reasons[0]; // e.g., "Testing Ban"
+                        const expiryArray = playfabData.errorDetails[reasons[0]];
+                        if (Array.isArray(expiryArray) && expiryArray.length > 0) {
+                            banInfo.expiry = expiryArray[0]; // e.g., "2025-09-27T06:40:47"
+                        }
+                    }
+                }
+                
+                return res.status(403).json({
+                    success: false,
+                    error: 'AccountBanned',
+                    errorCode: playfabData.errorCode,
+                    errorMessage: playfabData.errorMessage,
+                    banInfo: banInfo,
+                    details: playfabData.errorMessage // Keep for backward compatibility
+                });
+            }
+            
+            // Other PlayFab errors
             return res.status(playfabResponse.status).json({
                 success: false,
                 error: 'PlayFab login failed',
+                errorCode: playfabData.errorCode,
+                errorMessage: playfabData.errorMessage,
                 details: playfabData.errorMessage
             });
         }
