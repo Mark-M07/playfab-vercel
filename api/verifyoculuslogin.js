@@ -19,12 +19,38 @@ export default async function handler(req, res) {
             });
         }
 
-        const { userId, nonce } = req.body;
-        if (!userId || !nonce) {
+        const { userId: receivedUserId, nonce } = req.body;
+        if (!receivedUserId || !nonce) {
             return res.status(400).json({ 
                 success: false, 
                 error: 'Missing userId or nonce' 
             });
+        }
+
+        // Parse userId for backward compatibility
+        let metaId = receivedUserId;
+        let appInstanceHash = null;
+        if (receivedUserId.includes('|')) {
+            const parts = receivedUserId.split('|');
+            if (parts.length === 2) {
+                metaId = parts[0];
+                appInstanceHash = parts[1];
+                // Optional: Basic validation of hash format (Base64 SHA256 is typically 44 chars)
+                if (!/^[A-Za-z0-9+/=]+$/.test(appInstanceHash) || appInstanceHash.length !== 44) {
+                    console.warn(`Invalid hash format: ${appInstanceHash}`);
+                    return res.status(400).json({
+                        success: false,
+                        error: 'Invalid session context'
+                    });
+                }
+            } else {
+                // Malformed composite userId
+                console.error(`Malformed userId: ${receivedUserId}`);
+                return res.status(400).json({
+                    success: false,
+                    error: 'Invalid userId format'
+                });
+            }
         }
 
         const appId = process.env.OCULUS_APP_ID;
@@ -37,7 +63,7 @@ export default async function handler(req, res) {
         }
 
         const accessToken = `OC|${appId}|${appSecret}`;
-        const url = `https://graph.oculus.com/user_nonce_validate?nonce=${nonce}&user_id=${userId}&access_token=${accessToken}`;
+        const url = `https://graph.oculus.com/user_nonce_validate?nonce=${nonce}&user_id=${metaId}&access_token=${accessToken}`;
 
         const oculusResponse = await fetch(url, {
             method: 'POST'
@@ -72,7 +98,7 @@ export default async function handler(req, res) {
             });
         }
 
-        // Valid nonce: Perform PlayFab Server LoginWithCustomID
+        // Valid nonce: Check device ban if hash present
         const titleId = process.env.PLAYFAB_TITLE_ID;
         const secretKey = process.env.PLAYFAB_DEV_SECRET_KEY;
         
@@ -83,9 +109,57 @@ export default async function handler(req, res) {
             });
         }
 
+        if (appInstanceHash) {
+            // Fetch banned devices from PlayFab Internal Title Data
+            const bannedKey = 'BannedHardwareInstances';
+            const getInternalDataUrl = `https://${titleId}.playfabapi.com/Admin/GetTitleInternalData`;
+            const getInternalDataBody = JSON.stringify({
+                Keys: [bannedKey]
+            });
+
+            const internalDataResponse = await fetch(getInternalDataUrl, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-SecretKey': secretKey
+                },
+                body: getInternalDataBody
+            });
+
+            const internalData = await internalDataResponse.json();
+            if (!internalDataResponse.ok) {
+                console.error('PlayFab internal data fetch failed:', internalData);
+                // For backward compat, don't fail hard - log and proceed without check
+            } else {
+                let bannedInstances = [];
+                if (internalData.data.Data && internalData.data.Data[bannedKey]) {
+                    try {
+                        bannedInstances = JSON.parse(internalData.data.Data[bannedKey]);
+                    } catch (e) {
+                        console.error('Error parsing banned list:', e);
+                    }
+                }
+
+                if (bannedInstances.includes(appInstanceHash)) {
+                    console.log(`Banned instance detected: ${appInstanceHash}`);
+                    return res.status(403).json({
+                        success: false,
+                        error: 'AccountBanned',
+                        errorCode: 1002,
+                        errorMessage: 'Account access restricted',
+                        banInfo: {
+                            reason: 'Violation of terms',
+                            expiry: 'Indefinite'
+                        }
+                    });
+                }
+            }
+        }
+
+        // Perform PlayFab Server LoginWithCustomID
         const playfabUrl = `https://${titleId}.playfabapi.com/Server/LoginWithCustomID`;
         const playfabBody = JSON.stringify({
-            CustomId: userId,
+            CustomId: metaId,
             CreateAccount: true,
             InfoRequestParameters: {
                 GetUserAccountInfo: true,
@@ -149,6 +223,33 @@ export default async function handler(req, res) {
                 errorMessage: playfabData.errorMessage,
                 details: playfabData.errorMessage
             });
+        }
+
+        // Successful login: Store hash if present
+        if (appInstanceHash) {
+            const internalDataKey = 'SessionInstanceContext';
+            const updateInternalUrl = `https://${titleId}.playfabapi.com/Server/UpdateUserInternalData`;
+            const updateInternalBody = JSON.stringify({
+                PlayFabId: playfabData.data.PlayFabId,
+                Data: {
+                    [internalDataKey]: appInstanceHash
+                }
+            });
+
+            const updateResponse = await fetch(updateInternalUrl, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-SecretKey': secretKey
+                },
+                body: updateInternalBody
+            });
+
+            if (!updateResponse.ok) {
+                const updateError = await updateResponse.json();
+                console.error('Failed to update internal data:', updateError);
+                // Don't fail the login - just log
+            }
         }
 
         return res.status(200).json({
