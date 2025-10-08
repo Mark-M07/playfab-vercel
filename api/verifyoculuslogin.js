@@ -9,8 +9,6 @@ import fetch from 'node-fetch';
  * @param {Object} res - Response with session details or error
  */
 export default async function handler(req, res) {
-    console.log('Received Oculus login request:', req.body);
-    
     try {
         if (req.method !== 'POST') {
             return res.status(405).json({ 
@@ -23,11 +21,10 @@ export default async function handler(req, res) {
         if (!receivedUserId || !nonce) {
             return res.status(400).json({ 
                 success: false, 
-                error: 'Authentication failed'  // Genericized
+                error: 'Authentication failed'
             });
         }
 
-        // Parse userId for backward compatibility
         let metaId = receivedUserId;
         let appInstanceHash = null;
         if (receivedUserId.includes('|')) {
@@ -35,17 +32,13 @@ export default async function handler(req, res) {
             if (parts.length === 2) {
                 metaId = parts[0];
                 appInstanceHash = parts[1];
-                // Optional: Basic validation of hash format (Base64 SHA256 is typically 44 chars)
                 if (!/^[A-Za-z0-9+/=]+$/.test(appInstanceHash) || appInstanceHash.length !== 44) {
-                    console.warn(`Invalid hash format: ${appInstanceHash}`);
                     return res.status(400).json({
                         success: false,
                         error: 'Authentication failed'
                     });
                 }
             } else {
-                // Malformed composite userId
-                console.error(`Malformed userId: ${receivedUserId}`);
                 return res.status(400).json({
                     success: false,
                     error: 'Authentication failed'
@@ -53,9 +46,7 @@ export default async function handler(req, res) {
             }
         }
 
-        // Quick sanity check on metaId (Oculus IDs are numeric)
         if (!/^\d+$/.test(metaId)) {
-            console.error(`Invalid metaId format: ${metaId}`);
             return res.status(400).json({
                 success: false,
                 error: 'Authentication failed'
@@ -65,7 +56,6 @@ export default async function handler(req, res) {
         const appId = process.env.OCULUS_APP_ID;
         const appSecret = process.env.OCULUS_APP_SECRET;
         if (!appId || !appSecret) {
-            console.error('Missing Oculus config');  // Log for debugging
             return res.status(500).json({ 
                 success: false, 
                 error: 'Internal Server Error' 
@@ -82,11 +72,10 @@ export default async function handler(req, res) {
         const oculusBody = await oculusResponse.text();
 
         if (!oculusResponse.ok) {
-            console.error('Oculus validation failed:', oculusBody);
             return res.status(oculusResponse.status).json({
                 success: false,
-                error: 'Authentication failed',  // Genericized
-                details: oculusBody  // Keep details but consider removing if too revealing; log instead
+                error: 'Authentication failed',
+                details: oculusBody
             });
         }
 
@@ -94,26 +83,23 @@ export default async function handler(req, res) {
         try {
             oculusResult = JSON.parse(oculusBody);
         } catch (e) {
-            console.error('Invalid Oculus response:', e);  // Log error
             return res.status(500).json({
                 success: false,
-                error: 'Internal Server Error'  // Genericized
+                error: 'Internal Server Error'
             });
         }
 
         if (!oculusResult.is_valid) {
             return res.status(400).json({
                 success: false,
-                error: 'Authentication failed'  // Genericized
+                error: 'Authentication failed'
             });
         }
 
-        // Valid nonce: Check device ban if hash present
         const titleId = process.env.PLAYFAB_TITLE_ID;
         const secretKey = process.env.PLAYFAB_DEV_SECRET_KEY;
         
         if (!titleId || !secretKey) {
-            console.error('Missing PlayFab config');  // Log for debugging
             return res.status(500).json({ 
                 success: false, 
                 error: 'Internal Server Error' 
@@ -121,7 +107,6 @@ export default async function handler(req, res) {
         }
 
         if (appInstanceHash) {
-            // Fetch banned devices from PlayFab Internal Title Data
             const bannedKey = 'BannedHardwareInstances';
             const getInternalDataUrl = `https://${titleId}.playfabapi.com/Admin/GetTitleInternalData`;
             const getInternalDataBody = JSON.stringify({
@@ -138,21 +123,15 @@ export default async function handler(req, res) {
             });
 
             const internalData = await internalDataResponse.json();
-            if (!internalDataResponse.ok) {
-                console.error('PlayFab internal data fetch failed:', internalData);
-                // For backward compat, don't fail hard - log and proceed without check
-            } else {
+            if (internalDataResponse.ok) {
                 let bannedInstances = [];
                 if (internalData.data.Data && internalData.data.Data[bannedKey]) {
                     try {
                         bannedInstances = JSON.parse(internalData.data.Data[bannedKey]);
-                    } catch (e) {
-                        console.error('Error parsing banned list:', e);
-                    }
+                    } catch (e) {}
                 }
 
                 if (bannedInstances.includes(appInstanceHash)) {
-                    console.log(`Banned instance detected: ${appInstanceHash}`);
                     return res.status(403).json({
                         success: false,
                         error: 'AccountBanned',
@@ -168,7 +147,6 @@ export default async function handler(req, res) {
             }
         }
 
-        // Perform PlayFab Server LoginWithCustomID
         const playfabUrl = `https://${titleId}.playfabapi.com/Server/LoginWithCustomID`;
         const playfabBody = JSON.stringify({
             CustomId: metaId,
@@ -194,25 +172,19 @@ export default async function handler(req, res) {
         const playfabData = await playfabResponse.json();
 
         if (!playfabResponse.ok) {
-            console.error('PlayFab login failed:', playfabData);
-            
-            // Special handling for account bans
             if (playfabData.error === 'AccountBanned' || playfabData.errorCode === 1002) {
-                // Extract ban details
                 const banInfo = {
                     reason: null,
                     expiry: null
                 };
                 
-                // PlayFab returns errorDetails as an object with ban reasons as keys
-                // and expiry dates as array values
                 if (playfabData.errorDetails) {
                     const reasons = Object.keys(playfabData.errorDetails);
                     if (reasons.length > 0) {
-                        banInfo.reason = reasons[0]; // e.g., "Testing Ban"
+                        banInfo.reason = reasons[0];
                         const expiryArray = playfabData.errorDetails[reasons[0]];
                         if (Array.isArray(expiryArray) && expiryArray.length > 0) {
-                            banInfo.expiry = expiryArray[0]; // e.g., "2025-09-27T06:40:47"
+                            banInfo.expiry = expiryArray[0];
                         }
                     }
                 }
@@ -223,30 +195,28 @@ export default async function handler(req, res) {
                     errorCode: playfabData.errorCode,
                     errorMessage: playfabData.errorMessage,
                     banInfo: banInfo,
-                    details: playfabData.errorMessage // Keep for backward compatibility
+                    details: playfabData.errorMessage
                 });
             }
             
-            // Other PlayFab errors
             return res.status(playfabResponse.status).json({
                 success: false,
-                error: 'Authentication failed',  // Genericized for non-ban errors
+                error: 'Authentication failed',
                 errorCode: playfabData.errorCode,
                 errorMessage: playfabData.errorMessage,
                 details: playfabData.errorMessage
             });
         }
 
-        // Successful login: Store hash if present
         if (appInstanceHash) {
-            const internalDataKey = 'DeviceID';
+            const internalDataKey = 'deviceID';
             const updateInternalUrl = `https://${titleId}.playfabapi.com/Server/UpdateUserInternalData`;
             const updateInternalBody = JSON.stringify({
                 PlayFabId: playfabData.data.PlayFabId,
                 Data: {
                     [internalDataKey]: appInstanceHash
                 },
-                Permission: 'Private'  // Added for explicit privacy (though Internal Data is already secure)
+                Permission: 'Private'
             });
 
             const updateResponse = await fetch(updateInternalUrl, {
@@ -261,7 +231,6 @@ export default async function handler(req, res) {
             if (!updateResponse.ok) {
                 const updateError = await updateResponse.json();
                 console.error('Failed to update internal data:', updateError);
-                // Don't fail the login - just log
             }
         }
 
