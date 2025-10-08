@@ -23,7 +23,7 @@ export default async function handler(req, res) {
         if (!receivedUserId || !nonce) {
             return res.status(400).json({ 
                 success: false, 
-                error: 'Missing userId or nonce' 
+                error: 'Authentication failed'  // Genericized
             });
         }
 
@@ -40,7 +40,7 @@ export default async function handler(req, res) {
                     console.warn(`Invalid hash format: ${appInstanceHash}`);
                     return res.status(400).json({
                         success: false,
-                        error: 'Invalid session context'
+                        error: 'Authentication failed'
                     });
                 }
             } else {
@@ -48,17 +48,27 @@ export default async function handler(req, res) {
                 console.error(`Malformed userId: ${receivedUserId}`);
                 return res.status(400).json({
                     success: false,
-                    error: 'Invalid userId format'
+                    error: 'Authentication failed'
                 });
             }
+        }
+
+        // Quick sanity check on metaId (Oculus IDs are numeric)
+        if (!/^\d+$/.test(metaId)) {
+            console.error(`Invalid metaId format: ${metaId}`);
+            return res.status(400).json({
+                success: false,
+                error: 'Authentication failed'
+            });
         }
 
         const appId = process.env.OCULUS_APP_ID;
         const appSecret = process.env.OCULUS_APP_SECRET;
         if (!appId || !appSecret) {
+            console.error('Missing Oculus config');  // Log for debugging
             return res.status(500).json({ 
                 success: false, 
-                error: 'Server configuration error' 
+                error: 'Internal Server Error' 
             });
         }
 
@@ -75,8 +85,8 @@ export default async function handler(req, res) {
             console.error('Oculus validation failed:', oculusBody);
             return res.status(oculusResponse.status).json({
                 success: false,
-                error: 'Oculus validation failed',
-                details: oculusBody
+                error: 'Authentication failed',  // Genericized
+                details: oculusBody  // Keep details but consider removing if too revealing; log instead
             });
         }
 
@@ -84,17 +94,17 @@ export default async function handler(req, res) {
         try {
             oculusResult = JSON.parse(oculusBody);
         } catch (e) {
+            console.error('Invalid Oculus response:', e);  // Log error
             return res.status(500).json({
                 success: false,
-                error: 'Invalid response from Oculus',
-                details: oculusBody
+                error: 'Internal Server Error'  // Genericized
             });
         }
 
         if (!oculusResult.is_valid) {
             return res.status(400).json({
                 success: false,
-                error: 'Invalid nonce'
+                error: 'Authentication failed'  // Genericized
             });
         }
 
@@ -103,9 +113,10 @@ export default async function handler(req, res) {
         const secretKey = process.env.PLAYFAB_DEV_SECRET_KEY;
         
         if (!titleId || !secretKey) {
+            console.error('Missing PlayFab config');  // Log for debugging
             return res.status(500).json({ 
                 success: false, 
-                error: 'PlayFab configuration error' 
+                error: 'Internal Server Error' 
             });
         }
 
@@ -219,7 +230,7 @@ export default async function handler(req, res) {
             // Other PlayFab errors
             return res.status(playfabResponse.status).json({
                 success: false,
-                error: 'PlayFab login failed',
+                error: 'Authentication failed',  // Genericized for non-ban errors
                 errorCode: playfabData.errorCode,
                 errorMessage: playfabData.errorMessage,
                 details: playfabData.errorMessage
@@ -228,13 +239,14 @@ export default async function handler(req, res) {
 
         // Successful login: Store hash if present
         if (appInstanceHash) {
-            const internalDataKey = 'SessionInstanceContext';
+            const internalDataKey = 'DeviceID';
             const updateInternalUrl = `https://${titleId}.playfabapi.com/Server/UpdateUserInternalData`;
             const updateInternalBody = JSON.stringify({
                 PlayFabId: playfabData.data.PlayFabId,
                 Data: {
                     [internalDataKey]: appInstanceHash
-                }
+                },
+                Permission: 'Private'  // Added for explicit privacy (though Internal Data is already secure)
             });
 
             const updateResponse = await fetch(updateInternalUrl, {
