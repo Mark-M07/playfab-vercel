@@ -107,7 +107,7 @@ export default async function handler(req, res) {
         }
 
         if (appInstanceHash) {
-            const bannedKey = 'BannedHardwareInstances';
+            const bannedKey = 'BannedDevices';
             const getInternalDataUrl = `https://${titleId}.playfabapi.com/Admin/GetTitleInternalData`;
             const getInternalDataBody = JSON.stringify({
                 Keys: [bannedKey]
