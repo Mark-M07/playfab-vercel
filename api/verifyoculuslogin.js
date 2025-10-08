@@ -1,4 +1,5 @@
 import fetch from 'node-fetch';
+import querystring from 'node:querystring';
 
 /**
  * API Module for Oculus nonce validation and PlayFab login
@@ -17,7 +18,29 @@ export default async function handler(req, res) {
             });
         }
 
-        const { userId: receivedUserId, nonce } = req.body;
+        if (!req.body) {
+            return res.status(400).json({ 
+                success: false, 
+                error: 'Authentication failed'
+            });
+        }
+
+        let bodyData;
+        const contentType = req.headers['content-type'] || '';
+
+        if (contentType.includes('application/x-www-form-urlencoded')) {
+            const rawBody = await new Promise((resolve, reject) => {
+                let data = '';
+                req.on('data', chunk => data += chunk);
+                req.on('end', () => resolve(data));
+                req.on('error', reject);
+            });
+            bodyData = querystring.parse(rawBody);
+        } else {
+            bodyData = req.body;
+        }
+
+        const { userId: receivedUserId, nonce } = bodyData;
         if (!receivedUserId || !nonce) {
             return res.status(400).json({ 
                 success: false, 
