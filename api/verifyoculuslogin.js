@@ -146,11 +146,12 @@ export default async function handler(req, res) {
                         success: false,
                         error: 'AccountBanned',
                         errorCode: 1002,
-                        errorMessage: 'Account access restricted',
+                        errorMessage: 'The account making this request is currently banned',
                         banInfo: {
-                            reason: 'Violation of terms',
+                            reason: 'Severe Modding',
                             expiry: 'Indefinite'
-                        }
+                        },
+                        details: 'The account making this request is currently banned'
                     });
                 }
             }
@@ -266,7 +267,7 @@ export default async function handler(req, res) {
     } catch (err) {
         console.error('Error processing Oculus login:', err);
         return res.status(500).json({ 
-            success: false,
+            success: false, 
             error: 'Internal Server Error' 
         });
     }
