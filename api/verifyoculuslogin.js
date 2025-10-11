@@ -129,11 +129,11 @@ export default async function handler(req, res) {
             });
         }
 
-        if (appInstanceHash) {
-            const bannedKey = 'BannedDevices';
+        let validationToken = null;
+        if (appInstanceHash || true) { // Always fetch to get token
             const getInternalDataUrl = `https://${titleId}.playfabapi.com/Admin/GetTitleInternalData`;
             const getInternalDataBody = JSON.stringify({
-                Keys: [bannedKey]
+                Keys: ['BannedDevices', 'ValidationToken']
             });
 
             const internalDataResponse = await fetch(getInternalDataUrl, {
@@ -145,27 +145,34 @@ export default async function handler(req, res) {
                 body: getInternalDataBody
             });
 
-            const internalData = await internalDataResponse.json();
             if (internalDataResponse.ok) {
-                let bannedInstances = [];
-                if (internalData.data.Data && internalData.data.Data[bannedKey]) {
-                    try {
-                        bannedInstances = JSON.parse(internalData.data.Data[bannedKey]);
-                    } catch (e) {}
+                const internalData = await internalDataResponse.json();
+                
+                // Check for validation token
+                if (internalData.data?.Data?.ValidationToken) {
+                    validationToken = internalData.data.Data.ValidationToken;
                 }
+                
+                // Check for banned devices (only if we have an appInstanceHash)
+                if (appInstanceHash && internalData.data?.Data?.BannedDevices) {
+                    let bannedInstances = [];
+                    try {
+                        bannedInstances = JSON.parse(internalData.data.Data.BannedDevices);
+                    } catch (e) {}
 
-                if (bannedInstances.includes(appInstanceHash)) {
-                    return res.status(403).json({
-                        success: false,
-                        error: 'AccountBanned',
-                        errorCode: 1002,
-                        errorMessage: 'The account making this request is currently banned',
-                        banInfo: {
-                            reason: 'Severe Modding',
-                            expiry: 'Indefinite'
-                        },
-                        details: 'The account making this request is currently banned'
-                    });
+                    if (bannedInstances.includes(appInstanceHash)) {
+                        return res.status(403).json({
+                            success: false,
+                            error: 'AccountBanned',
+                            errorCode: 1002,
+                            errorMessage: 'The account making this request is currently banned',
+                            banInfo: {
+                                reason: 'Severe Modding',
+                                expiry: 'Indefinite'
+                            },
+                            details: 'The account making this request is currently banned'
+                        });
+                    }
                 }
             }
         }
@@ -265,7 +272,8 @@ export default async function handler(req, res) {
             infoPayload: JSON.stringify(playfabData.data.InfoResultPayload),
             entityToken: playfabData.data.EntityToken.EntityToken,
             entityId: playfabData.data.EntityToken.Entity.Id,
-            entityType: playfabData.data.EntityToken.Entity.Type
+            entityType: playfabData.data.EntityToken.Entity.Type,
+            token: validationToken
         });
 
     } catch (err) {
