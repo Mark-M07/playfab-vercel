@@ -4,8 +4,8 @@ import crypto from 'crypto';
 /**
  * API Module for automated token rotation
  * Generates and stores a new validation token in PlayFab TitleInternalData
- * Called via Vercel Cron at random intervals
- * Requires PLAYFAB_TITLE_ID, PLAYFAB_DEV_SECRET_KEY, ROTATION_SECRET env vars
+ * Called via Vercel Cron every 3 hours
+ * Requires PLAYFAB_TITLE_ID, PLAYFAB_DEV_SECRET_KEY env vars
  * @route POST /api/rotatetoken
  */
 export default async function handler(req, res) {
@@ -14,17 +14,6 @@ export default async function handler(req, res) {
             return res.status(405).json({ 
                 success: false, 
                 error: 'Method Not Allowed' 
-            });
-        }
-
-        // Verify the request is authorized (from Vercel Cron)
-        const authSecret = req.headers['x-rotation-secret'] || req.body?.secret;
-        const expectedSecret = process.env.ROTATION_SECRET;
-        
-        if (!expectedSecret || authSecret !== expectedSecret) {
-            return res.status(401).json({ 
-                success: false, 
-                error: 'Unauthorized' 
             });
         }
 
