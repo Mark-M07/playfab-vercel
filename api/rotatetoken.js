@@ -6,11 +6,11 @@ import crypto from 'crypto';
  * Generates and stores a new validation token in PlayFab TitleInternalData
  * Called via Vercel Cron every 3 hours
  * Requires PLAYFAB_TITLE_ID, PLAYFAB_DEV_SECRET_KEY env vars
- * @route POST /api/rotatetoken
+ * @route GET /api/rotatetoken
  */
 export default async function handler(req, res) {
     try {
-        if (req.method !== 'POST') {
+        if (req.method !== 'GET') {
             return res.status(405).json({ 
                 success: false, 
                 error: 'Method Not Allowed' 
