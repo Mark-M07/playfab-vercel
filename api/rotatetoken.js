@@ -3,7 +3,7 @@ import crypto from 'crypto';
 
 /**
  * API Module for automated token rotation
- * Generates and stores a new validation token in PlayFab TitleInternalData
+ * Generates and stores a new validation token in PlayFab Title Data (public)
  * Called via Vercel Cron every 3 hours
  * Requires PLAYFAB_TITLE_ID, PLAYFAB_DEV_SECRET_KEY env vars
  * @route GET /api/rotatetoken
@@ -30,8 +30,8 @@ export default async function handler(req, res) {
         // Generate a new cryptographically secure token
         const newToken = crypto.randomBytes(32).toString('base64');
 
-        // Store the new token in PlayFab TitleInternalData
-        const updateUrl = `https://${titleId}.playfabapi.com/Admin/SetTitleInternalData`;
+        // Store the new token in PlayFab Title Data (public, accessible by clients)
+        const updateUrl = `https://${titleId}.playfabapi.com/Admin/SetTitleData`;
         const updateBody = JSON.stringify({
             Key: 'ValidationToken',
             Value: newToken
