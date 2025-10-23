@@ -5,23 +5,16 @@ import https from 'https';
 /**
  * ENHANCED API Module for automated token AND certificate rotation
  * 
- * This cron job now:
+ * This cron job:
  * 1. Rotates validation token (existing functionality)
  * 2. Checks PlayFab certificate for rotation
  * 3. Auto-updates PLAYFAB_CERT_FINGERPRINT if changed
  * 
- * Called via Vercel Cron every 1-3 hours
+ * Called via Vercel Cron every 1 hour
  * Requires PLAYFAB_TITLE_ID, PLAYFAB_DEV_SECRET_KEY, VERCEL_TOKEN env vars
  * @route GET /api/rotatetoken
  */
 
-/**
- * Fetches current PlayFab certificate fingerprint
- * This is SAFE to do from server-side because:
- * - Runs on YOUR Vercel server (not user's network)
- * - Vercel validates TLS connection normally
- * - Not subject to user's MITM proxy
- */
 async function getCurrentPlayFabCertificate(titleId) {
     return new Promise((resolve) => {
         const options = {
@@ -153,9 +146,6 @@ async function updateVercelEnvVar(key, value, vercelToken, projectId) {
     }
 }
 
-/**
- * Triggers a Vercel redeployment
- */
 async function triggerRedeployment(vercelToken, projectId, deploymentId) {
     try {
         const url = `https://api.vercel.com/v13/deployments`;
