@@ -3,18 +3,23 @@ import crypto from 'crypto';
 import https from 'https';
 
 /**
- * ENHANCED API Module for automated token AND certificate rotation
+ * SIMPLE Certificate Monitoring (Alert-Only)
  * 
- * This cron job:
+ * This version:
  * 1. Rotates validation token (existing functionality)
  * 2. Checks PlayFab certificate for rotation
- * 3. Auto-updates PLAYFAB_CERT_FINGERPRINT if changed
+ * 3. ALERTS you if rotation detected (does NOT auto-update)
  * 
- * Called via Vercel Cron every 1 hour
- * Requires PLAYFAB_TITLE_ID, PLAYFAB_DEV_SECRET_KEY, VERCEL_TOKEN env vars
+ * No VERCEL_TOKEN or VERCEL_PROJECT_ID required!
+ * 
+ * Called via Vercel Cron
+ * Requires only: PLAYFAB_TITLE_ID, PLAYFAB_DEV_SECRET_KEY, PLAYFAB_CERT_FINGERPRINT
  * @route GET /api/rotatetoken
  */
 
+/**
+ * Fetches current PlayFab certificate fingerprint
+ */
 async function getCurrentPlayFabCertificate(titleId) {
     return new Promise((resolve) => {
         const options = {
@@ -22,7 +27,7 @@ async function getCurrentPlayFabCertificate(titleId) {
             port: 443,
             method: 'GET',
             path: '/',
-            rejectUnauthorized: true, // Vercel validates TLS
+            rejectUnauthorized: true,
             timeout: 10000
         };
 
@@ -71,109 +76,6 @@ async function getCurrentPlayFabCertificate(titleId) {
     });
 }
 
-/**
- * Updates Vercel environment variable using Vercel API
- * Requires VERCEL_TOKEN with appropriate permissions
- */
-async function updateVercelEnvVar(key, value, vercelToken, projectId) {
-    try {
-        // First, get the current environment variable ID
-        const getUrl = `https://api.vercel.com/v9/projects/${projectId}/env`;
-        const getResponse = await fetch(getUrl, {
-            method: 'GET',
-            headers: {
-                'Authorization': `Bearer ${vercelToken}`,
-                'Content-Type': 'application/json'
-            }
-        });
-
-        if (!getResponse.ok) {
-            console.error('Failed to fetch env vars:', await getResponse.text());
-            return { success: false, error: 'FETCH_FAILED' };
-        }
-
-        const envVars = await getResponse.json();
-        const existingVar = envVars.envs?.find(env => env.key === key);
-
-        if (existingVar) {
-            // Update existing variable
-            const updateUrl = `https://api.vercel.com/v9/projects/${projectId}/env/${existingVar.id}`;
-            const updateResponse = await fetch(updateUrl, {
-                method: 'PATCH',
-                headers: {
-                    'Authorization': `Bearer ${vercelToken}`,
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    value: value,
-                    target: ['production', 'preview', 'development']
-                })
-            });
-
-            if (!updateResponse.ok) {
-                console.error('Failed to update env var:', await updateResponse.text());
-                return { success: false, error: 'UPDATE_FAILED' };
-            }
-
-            return { success: true, action: 'updated' };
-        } else {
-            // Create new variable
-            const createUrl = `https://api.vercel.com/v10/projects/${projectId}/env`;
-            const createResponse = await fetch(createUrl, {
-                method: 'POST',
-                headers: {
-                    'Authorization': `Bearer ${vercelToken}`,
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    key: key,
-                    value: value,
-                    type: 'encrypted',
-                    target: ['production', 'preview', 'development']
-                })
-            });
-
-            if (!createResponse.ok) {
-                console.error('Failed to create env var:', await createResponse.text());
-                return { success: false, error: 'CREATE_FAILED' };
-            }
-
-            return { success: true, action: 'created' };
-        }
-    } catch (error) {
-        console.error('Error updating Vercel env var:', error);
-        return { success: false, error: error.message };
-    }
-}
-
-async function triggerRedeployment(vercelToken, projectId, deploymentId) {
-    try {
-        const url = `https://api.vercel.com/v13/deployments`;
-        const response = await fetch(url, {
-            method: 'POST',
-            headers: {
-                'Authorization': `Bearer ${vercelToken}`,
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-                name: projectId,
-                target: 'production',
-                deploymentId: deploymentId
-            })
-        });
-
-        if (!response.ok) {
-            console.error('Failed to trigger redeployment:', await response.text());
-            return { success: false };
-        }
-
-        return { success: true };
-    } catch (error) {
-        console.error('Error triggering redeployment:', error);
-        return { success: false, error: error.message };
-    }
-}
-
 export default async function handler(req, res) {
     const startTime = Date.now();
     const results = {
@@ -192,8 +94,6 @@ export default async function handler(req, res) {
 
         const titleId = process.env.PLAYFAB_TITLE_ID;
         const secretKey = process.env.PLAYFAB_DEV_SECRET_KEY;
-        const vercelToken = process.env.VERCEL_TOKEN;
-        const vercelProjectId = process.env.VERCEL_PROJECT_ID;
         
         if (!titleId || !secretKey) {
             return res.status(500).json({ 
@@ -270,56 +170,51 @@ export default async function handler(req, res) {
             // Check if fingerprint has changed
             if (!storedFingerprint) {
                 console.warn('⚠️  PLAYFAB_CERT_FINGERPRINT not set in environment');
+                console.warn('Current certificate fingerprint:');
+                console.warn(currentFingerprint);
                 results.certificateCheck.status = 'NOT_CONFIGURED';
-                results.certificateCheck.action = 'Please set PLAYFAB_CERT_FINGERPRINT manually';
+                results.certificateCheck.action = 'Set PLAYFAB_CERT_FINGERPRINT in Vercel dashboard';
             } else if (currentFingerprint === storedFingerprint) {
-                console.log('✅ Certificate fingerprint unchanged');
-                results.certificateCheck.status = 'UNCHANGED';
+                console.log('✅ Certificate fingerprint matches stored value');
+                results.certificateCheck.status = 'VALID';
                 
                 // Warn if expiring soon
                 if (currentCert.daysUntilExpiry < 30) {
                     console.warn(`⚠️  Certificate expires in ${currentCert.daysUntilExpiry} days!`);
+                    console.warn('PlayFab will likely rotate the certificate soon.');
                     results.certificateCheck.warning = `Certificate expires in ${currentCert.daysUntilExpiry} days`;
                 }
             } else {
-                console.warn('🚨 CERTIFICATE ROTATION DETECTED!');
-                console.warn(`Old fingerprint: ${storedFingerprint}`);
-                console.warn(`New fingerprint: ${currentFingerprint}`);
+                // CERTIFICATE ROTATION DETECTED!
+                console.error('═══════════════════════════════════════════════════');
+                console.error('🚨 CERTIFICATE ROTATION DETECTED!');
+                console.error('═══════════════════════════════════════════════════');
+                console.error('Old fingerprint (stored):');
+                console.error(storedFingerprint);
+                console.error('');
+                console.error('New fingerprint (current):');
+                console.error(currentFingerprint);
+                console.error('═══════════════════════════════════════════════════');
+                console.error('ACTION REQUIRED:');
+                console.error('1. Go to Vercel Dashboard → Settings → Environment Variables');
+                console.error('2. Update PLAYFAB_CERT_FINGERPRINT to:');
+                console.error(currentFingerprint);
+                console.error('3. Redeploy your application');
+                console.error('═══════════════════════════════════════════════════');
                 
-                results.certificateCheck.status = 'ROTATED';
+                results.certificateCheck.status = 'ROTATION_DETECTED';
                 results.certificateCheck.oldFingerprint = storedFingerprint;
                 results.certificateCheck.newFingerprint = currentFingerprint;
+                results.certificateCheck.action = 'MANUAL_UPDATE_REQUIRED';
+                results.certificateCheck.instructions = {
+                    step1: 'Go to Vercel Dashboard → Settings → Environment Variables',
+                    step2: `Update PLAYFAB_CERT_FINGERPRINT to: ${currentFingerprint}`,
+                    step3: 'Redeploy your application'
+                };
 
-                // Auto-update if Vercel token is configured
-                if (vercelToken && vercelProjectId) {
-                    console.log('🔄 Auto-updating certificate fingerprint...');
-                    
-                    const updateResult = await updateVercelEnvVar(
-                        'PLAYFAB_CERT_FINGERPRINT',
-                        currentFingerprint,
-                        vercelToken,
-                        vercelProjectId
-                    );
-
-                    if (updateResult.success) {
-                        console.log('✅ Certificate fingerprint updated successfully');
-                        results.certificateCheck.autoUpdateStatus = 'SUCCESS';
-                        results.certificateCheck.action = updateResult.action;
-                        
-                        console.log('🚀 Triggering redeployment...');
-                        const redeployResult = await triggerRedeployment(vercelToken, vercelProjectId);
-                        results.certificateCheck.redeployment = redeployResult.success ? 'TRIGGERED' : 'FAILED';
-                    } else {
-                        console.error('❌ Failed to update certificate fingerprint');
-                        results.certificateCheck.autoUpdateStatus = 'FAILED';
-                        results.certificateCheck.autoUpdateError = updateResult.error;
-                        results.certificateCheck.action = 'Manual update required';
-                    }
-                } else {
-                    console.warn('⚠️  VERCEL_TOKEN or VERCEL_PROJECT_ID not configured');
-                    results.certificateCheck.autoUpdateStatus = 'SKIPPED';
-                    results.certificateCheck.action = 'Manual update required - configure VERCEL_TOKEN and VERCEL_PROJECT_ID for auto-update';
-                }
+                // TODO: Add webhook notification here if you want
+                // await sendSlackAlert(...);
+                // await sendDiscordAlert(...);
             }
         }
 
@@ -333,14 +228,21 @@ export default async function handler(req, res) {
             results.tokenRotation?.success !== false &&
             results.certificateCheck?.success !== false;
 
-        if (allSuccessful) {
-            console.log(`✅ Rotation complete in ${duration}ms`);
+        const needsAttention = 
+            results.certificateCheck?.status === 'ROTATION_DETECTED' ||
+            results.certificateCheck?.status === 'NOT_CONFIGURED';
+
+        if (needsAttention) {
+            console.warn(`⚠️  Rotation complete with MANUAL ACTION REQUIRED (${duration}ms)`);
+        } else if (allSuccessful) {
+            console.log(`✅ Rotation complete - all checks passed (${duration}ms)`);
         } else {
-            console.warn(`⚠️  Rotation completed with warnings in ${duration}ms`);
+            console.warn(`⚠️  Rotation completed with warnings (${duration}ms)`);
         }
 
         return res.status(200).json({
             success: allSuccessful,
+            needsAttention: needsAttention,
             ...results
         });
 
