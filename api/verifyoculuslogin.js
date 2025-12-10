@@ -5,142 +5,87 @@ import crypto from 'crypto';
 
 const ENFORCE_ATTESTATION = false; // ← FLIP TO TRUE WHEN READY
 
-let cachedJWKS = null;
-let lastJWKSFetch = 0;
-const JWKS_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
-
-async function getOculusJWKS() {
-    const now = Date.now();
-
-    if (cachedJWKS && (now - lastJWKSFetch) < JWKS_TTL_MS) {
-        return cachedJWKS;
-    }
-
-    console.log("Refreshing Oculus JWKS...");
-
-    const jwksResp = await fetch("https://www.oculus.com/platform_integrity/jwks");
-    if (!jwksResp.ok) {
-        throw new Error("Failed to fetch Oculus JWKS");
-    }
-
-    const jwks = await jwksResp.json();
-    cachedJWKS = jwks;
-    lastJWKSFetch = now;
-
-    return jwks;
-}
-
-async function verifyMetaAttestationToken(token) {
+// Verify attestation token with Meta's server-to-server API
+// Returns verified payload if valid, null if verification fails
+async function verifyAttestationWithMeta(token, accessToken) {
     try {
-        if (!token) return false;
+        if (!token) return null;
 
-        const [headerB64, payloadB64, signatureB64] = token.split('.');
-        if (!headerB64 || !payloadB64 || !signatureB64) {
-            console.warn("[JWT VERIFY] Token is not a valid JWT format (missing parts)");
-            return false;
+        // Add timeout to prevent hanging requests
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
+
+        try {
+            // === TEST: Try POST with form body (preferred if it works) ===
+            console.log("[ATTESTATION TEST] Testing POST with form body...");
+            const postFormResp = await fetch(
+                "https://graph.oculus.com/platform_integrity/verify",
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: `token=${encodeURIComponent(token)}&access_token=${encodeURIComponent(accessToken)}`,
+                    signal: controller.signal
+                }
+            );
+            const postFormBody = await postFormResp.text();
+            console.log(`[ATTESTATION TEST] POST form - Status: ${postFormResp.status} | Body: ${postFormBody.slice(0, 300)}`);
+
+            // === TEST: Try POST with JSON body ===
+            console.log("[ATTESTATION TEST] Testing POST with JSON body...");
+            const postJsonResp = await fetch(
+                "https://graph.oculus.com/platform_integrity/verify",
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ token, access_token: accessToken }),
+                    signal: controller.signal
+                }
+            );
+            const postJsonBody = await postJsonResp.text();
+            console.log(`[ATTESTATION TEST] POST JSON - Status: ${postJsonResp.status} | Body: ${postJsonBody.slice(0, 300)}`);
+
+            // === ACTUAL: Use GET with query params (known working) ===
+            console.log("[ATTESTATION TEST] Using GET with query params (production)...");
+            const verifyResp = await fetch(
+                `https://graph.oculus.com/platform_integrity/verify?token=${encodeURIComponent(token)}&access_token=${encodeURIComponent(accessToken)}`,
+                { signal: controller.signal }
+            );
+            clearTimeout(timeoutId);
+
+            if (!verifyResp.ok) {
+                const errorText = await verifyResp.text();
+                console.error(`[ATTESTATION VERIFY] Meta API error: ${verifyResp.status} - ${errorText.slice(0, 200)}`);
+                return null;
+            }
+
+            // Safely parse response
+            let verifiedClaims;
+            try {
+                verifiedClaims = await verifyResp.json();
+            } catch {
+                console.error("[ATTESTATION VERIFY] Non-JSON response from Meta");
+                return null;
+            }
+
+            // Check for error response from Meta
+            if (verifiedClaims.error) {
+                console.error(`[ATTESTATION VERIFY] Meta returned error:`, verifiedClaims.error);
+                return null;
+            }
+
+            return verifiedClaims;
+        } catch (e) {
+            clearTimeout(timeoutId);
+            if (e.name === 'AbortError') {
+                console.error("[ATTESTATION VERIFY] Request timed out after 10s");
+            } else {
+                throw e;
+            }
+            return null;
         }
-
-        // Decode header to get alg + kid
-        const headerJson = Buffer.from(
-            headerB64.replace(/-/g, '+').replace(/_/g, '/'),
-            'base64'
-        ).toString();
-        const header = JSON.parse(headerJson);
-
-        const alg = header.alg;
-        const kid = header.kid;
-
-        if (!alg) {
-            console.warn("[JWT VERIFY] Missing alg in header");
-            return false;
-        }
-        if (!kid) {
-            console.warn("[JWT VERIFY] Missing kid in header");
-            return false;
-        }
-
-        if (alg === "PS256") {
-            // Meta is currently using PS256 (RSASSA-PSS + SHA-256)
-        } else if (alg === "RS256") {
-            // Some tokens might be RS256 in other contexts, so we allow both
-        } else {
-            console.warn("[JWT VERIFY] Unsupported alg:", alg);
-            return false;
-        }
-
-        // Fetch JWKS and find matching key
-        const jwks = await getOculusJWKS();
-        const key = jwks.keys.find(k => k.kid === kid);
-        if (!key || !key.x5c || !key.x5c.length) {
-            console.error("[JWT VERIFY] No matching JWKS key for kid:", kid);
-            return false;
-        }
-
-        // Build PEM from x5c certificate
-        const cert = key.x5c[0];
-        const pem = [
-            "-----BEGIN CERTIFICATE-----",
-            cert.match(/.{1,64}/g).join("\n"),
-            "-----END CERTIFICATE-----"
-        ].join("\n");
-
-        // Verify signature with SHA-256
-        const verifier = crypto.createVerify('RSA-SHA256');
-        verifier.update(`${headerB64}.${payloadB64}`);
-        verifier.end();
-
-        const signature = signatureB64
-            .replace(/-/g, '+')
-            .replace(/_/g, '/');
-
-        let verifyKey = pem;
-
-        // PS256 = RSASSA-PSS with SHA-256
-        if (alg === "PS256") {
-            verifyKey = {
-                key: pem,
-                padding: crypto.constants.RSA_PKCS1_PSS_PADDING,
-                saltLength: crypto.constants.RSA_PSS_SALTLEN_DIGEST
-            };
-        }
-        // RS256 uses default PKCS#1 v1.5 padding with the certificate pem
-
-        const validSignature = verifier.verify(verifyKey, signature, 'base64');
-        if (!validSignature) {
-            console.warn("[JWT VERIFY] Invalid signature");
-            return false;
-        }
-
-        // Decode payload
-        const payloadJson = Buffer.from(
-            payloadB64.replace(/-/g, '+').replace(/_/g, '/'),
-            'base64'
-        ).toString();
-        const payload = JSON.parse(payloadJson);
-
-        // Standard JWT claims
-        const now = Math.floor(Date.now() / 1000);
-        if (payload.exp && payload.exp < now) {
-            console.warn("[JWT VERIFY] Token expired");
-            return false;
-        }
-        if (payload.iat && payload.iat > now + 300) {
-            console.warn("[JWT VERIFY] Token issued in the future");
-            return false;
-        }
-        if (payload.iss !== "https://www.oculus.com") {
-            console.warn("[JWT VERIFY] Invalid iss:", payload.iss);
-            return false;
-        }
-        if (!payload.aud || !payload.aud.includes("com.ContinuumXR.UG")) {
-            console.warn("[JWT VERIFY] Invalid aud:", payload.aud);
-            return false;
-        }
-
-        return payload; // Verified + valid
     } catch (e) {
-        console.error("[JWT VERIFY ERROR]", e.message);
-        return false;
+        console.error("[ATTESTATION VERIFY ERROR]", e.message);
+        return null;
     }
 }
 
@@ -188,27 +133,53 @@ export default async function handler(req, res) {
         }
 
         // === Oculus Nonce Validation ===
-        const oculusResp = await fetch(
-            "https://graph.oculus.com/user_nonce_validate",
-            {
-                method: 'POST',
-                headers: {
-                    'Authorization': `Bearer ${oculusAccessToken}`,
-                    'Content-Type': 'application/x-www-form-urlencoded'
-                },
-                body: querystring.stringify({
-                    nonce,
-                    user_id: metaId
-                })
+        const nonceController = new AbortController();
+        const nonceTimeoutId = setTimeout(() => nonceController.abort(), 10000); // 10 second timeout
+        
+        let oculusResp;
+        let oculusBody;
+        try {
+            oculusResp = await fetch(
+                "https://graph.oculus.com/user_nonce_validate",
+                {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${oculusAccessToken}`,
+                        'Content-Type': 'application/x-www-form-urlencoded'
+                    },
+                    body: querystring.stringify({
+                        nonce,
+                        user_id: metaId
+                    }),
+                    signal: nonceController.signal
+                }
+            );
+            clearTimeout(nonceTimeoutId);
+            oculusBody = await oculusResp.text();
+        } catch (e) {
+            clearTimeout(nonceTimeoutId);
+            if (e.name === 'AbortError') {
+                console.error("[NONCE VALIDATE] Request timed out after 10s");
+            } else {
+                console.error("[NONCE VALIDATE] Request failed:", e.message);
             }
-        );
-
-        const oculusBody = await oculusResp.text();
-        if (!oculusResp.ok || !JSON.parse(oculusBody).is_valid) {
+            return res.status(503).json({ success: false, error: 'Service temporarily unavailable' });
+        }
+        
+        // 5.3: Safer parse of oculusBody
+        let nonceValidateResult;
+        try {
+            nonceValidateResult = JSON.parse(oculusBody);
+        } catch {
+            console.error("[NONCE VALIDATE] Non-JSON response:", oculusBody.slice(0, 200));
             return res.status(400).json({ success: false, error: 'Authentication failed' });
         }
 
-        // === META ATTESTATION VALIDATION ===
+        if (!oculusResp.ok || !nonceValidateResult.is_valid) {
+            return res.status(400).json({ success: false, error: 'Authentication failed' });
+        }
+
+        // === META ATTESTATION VALIDATION (Server-to-Server with Meta) ===
         let attestation = {
             valid: false,
             reason: "no_token",
@@ -219,57 +190,26 @@ export default async function handler(req, res) {
         };
 
         if (attestationToken) {
-            console.log("========== ATTESTATION DEBUG START ==========");
-            console.log("Raw token type:", typeof attestationToken);
-            console.log("Raw token length:", attestationToken.length);
+            // Call Meta's verification API - this is the ONLY secure way
+            const payload = await verifyAttestationWithMeta(attestationToken, oculusAccessToken);
 
-            const tokenPreview = attestationToken.slice(0, 60);
-            console.log("Token preview (first 60 chars):", tokenPreview);
-
-            const tokenParts = attestationToken.split(".");
-            console.log("JWT part count:", tokenParts.length);
-
-            if (tokenParts.length === 3) {
-                try {
-                    const headerJson = Buffer.from(
-                        tokenParts[0].replace(/-/g, '+').replace(/_/g, '/'),
-                        'base64'
-                    ).toString();
-
-                    console.log("JWT header JSON:", headerJson);
-
-                    const header = JSON.parse(headerJson);
-                    console.log("JWT header.alg:", header.alg);
-                    console.log("JWT header.kid:", header.kid);
-
-                } catch (e) {
-                    console.error("JWT header decode failed:", e.message);
-                }
-            } else {
-                console.warn("Token is NOT a valid JWT format (not 3 parts)");
-            }
-
-            console.log("========== ATTESTATION DEBUG END ==========");
-
-            const verifiedPayload = await verifyMetaAttestationToken(attestationToken);
-
-            if (!verifiedPayload) {
-                attestation.valid = false;
-                attestation.reason = "invalid_signature_or_claims";
-                console.warn(`[ATTESTATION FORGED] User:${metaId} attempted token forgery`);
-
+            if (!payload) {
+                // Meta couldn't verify the token - could be forged, expired, or API error
+                attestation.reason = "verification_failed";
+                console.warn(`[ATTESTATION] Meta verification failed for user: ${metaId}`);
+                
+                // 5.2: Treat verification failures softly - don't call it "AccountBanned"
+                // This could be a Meta outage or misconfiguration, not necessarily cheating
                 if (ENFORCE_ATTESTATION) {
                     return res.status(403).json({
                         success: false,
-                        error: "AccountBanned",
-                        errorCode: 1002,
-                        errorMessage: "Unable to authenticate. Please try again later.",
-                        banInfo: { reason: "Security violation", expiry: "Indefinite" }
+                        error: "VerificationFailed",
+                        errorCode: 1003, // Different from 1002 (AccountBanned)
+                        errorMessage: "Unable to verify device. Please try again later."
                     });
                 }
             } else {
-                const payload = verifiedPayload;
-
+                // Meta verified the token - now we can trust the claims
                 const rawApp = payload.app_state?.app_integrity_state || "unknown";
                 const rawDevice = payload.device_state?.device_integrity_state || "unknown";
 
@@ -280,16 +220,17 @@ export default async function handler(req, res) {
 
                 // Meta device ban check
                 if (attestation.device_ban?.is_banned === true) {
-                    console.warn(`[META DEVICE BANNED] UniqueId:${attestation.unique_id}`);
+                    console.warn(`[META DEVICE BANNED] User:${metaId} | UniqueId:${attestation.unique_id}`);
                     return res.status(403).json({
                         success: false,
                         error: "AccountBanned",
                         errorCode: 1002,
                         errorMessage: "This device is permanently banned.",
-                        banInfo: { reason: "Device banned by Meta", expiry: "Permanent" }
+                        banInfo: { reason: "Device banned", expiry: attestation.device_ban.remaining_ban_time || "Permanent" }
                     });
                 }
 
+                // Compute expected nonce
                 const expectedNonce = crypto.createHash('sha256')
                     .update(nonce)
                     .digest('base64')
@@ -297,18 +238,26 @@ export default async function handler(req, res) {
                     .replace(/\//g, '_')
                     .replace(/=+$/, '');
 
-                const valid = 
-                    payload.request_details?.nonce === expectedNonce &&
-                    payload.app_state?.package_id === "com.ContinuumXR.UG" &&
-                    rawApp === "StoreRecognized" &&
-                    rawDevice === "Advanced" &&
-                    Math.abs(Date.now() / 1000 - (payload.request_details?.timestamp || 0)) < 300;
+                // Validate claims - NOW these checks are meaningful because Meta verified the signature
+                const nonceOk = payload.request_details?.nonce === expectedNonce;
+                const packageOk = payload.app_state?.package_id === "com.ContinuumXR.UG";
+                const fresh = Math.abs(Date.now() / 1000 - (payload.request_details?.timestamp || 0)) < 300;
+                const strictAppOk = rawApp === "StoreRecognized";
+                const strictDeviceOk = rawDevice === "Advanced";
 
-                attestation.valid = valid;
-                attestation.reason = valid ? "ok" : "strict_validation_failed";
+                attestation.valid = nonceOk && packageOk && fresh && strictAppOk && strictDeviceOk;
 
-                if (!valid) {
-                    console.warn(`[ATTESTATION FAILED] User:${metaId} | App:${rawApp} | Device:${rawDevice}`);
+                if (!attestation.valid) {
+                    const failReasons = [];
+                    if (!nonceOk) failReasons.push("nonce_mismatch");
+                    if (!packageOk) failReasons.push("package_mismatch");
+                    if (!fresh) failReasons.push("token_stale");
+                    if (!strictAppOk) failReasons.push(`app_${rawApp}`);
+                    if (!strictDeviceOk) failReasons.push(`device_${rawDevice}`);
+                    attestation.reason = failReasons.join("|") || "unknown";
+                    console.warn(`[ATTESTATION FAILED] User:${metaId} | Reasons:${attestation.reason}`);
+                } else {
+                    attestation.reason = "ok";
                 }
             }
         }
@@ -333,12 +282,9 @@ export default async function handler(req, res) {
         const playfabData = await playfabResp.json();
 
         if (!playfabResp.ok) {
-            if (
-                playfabData.errorCode === 1002 && 
-                attestation.valid === false &&
-                attestation.reason !== "invalid_signature_or_claims" &&
-                attestation.unique_id
-            ) {
+            // 5.1: Cleaned up - removed dead "invalid_signature_or_claims" check
+            // Only apply Meta device ban if we have a verified unique_id and user is PlayFab banned
+            if (playfabData.errorCode === 1002 && attestation.unique_id) {
                 await banDeviceViaMeta(attestation.unique_id, oculusAccessToken);
             }
             return res.status(playfabData.errorCode === 1002 ? 403 : 400).json({
@@ -362,10 +308,11 @@ export default async function handler(req, res) {
                 });
             }
 
-            if (!attestation.valid) {
+            // Only enforce on claims failures, not verification_failed (handled above)
+            if (!attestation.valid && attestation.reason !== "verification_failed") {
                 let allow = false;
 
-                // === DEVELOPER BYPASS: Only for NotEvaluated ===
+                // === DEVELOPER BYPASS: Only for Meta-verified NotEvaluated ===
                 if (attestation.app_integrity === "NotEvaluated") {
                     const isDev = await isDeveloper(playFabId, titleId, secretKey);
                     if (isDev) {
@@ -383,7 +330,7 @@ export default async function handler(req, res) {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json', 'X-SecretKey': secretKey },
                             body: JSON.stringify({
-                                Bans: [{ PlayFabId: playFabId, Reason: "Security violation – tampered client" }]
+                                Bans: [{ PlayFabId: playFabId, Reason: `Attestation: ${attestation.reason}` }]
                             })
                         });
                     } catch (e) { console.error("[PLAYFAB BAN FAILED]", e); }
@@ -415,8 +362,9 @@ export default async function handler(req, res) {
             }
         }
 
-        // === Forensic Logging (ONLY on failure) ===
-        if (attestationToken && !attestation.valid) {
+        // === Forensic Logging (only on integrity failures, not verification_failed) ===
+        // verification_failed is logged separately to avoid conflating infra issues with cheating
+        if (attestationToken && !attestation.valid && attestation.reason !== "verification_failed") {
             const now = new Date().toISOString();
             const currentResp = await fetch(`https://${titleId}.playfabapi.com/Server/GetUserInternalData`, {
                 method: 'POST',
@@ -466,6 +414,36 @@ export default async function handler(req, res) {
             }
         }
 
+        // Log verification failures separately (infra issues, not client misbehaviour)
+        if (attestation.reason === "verification_failed") {
+            try {
+                const currentResp = await fetch(`https://${titleId}.playfabapi.com/Server/GetUserInternalData`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'X-SecretKey': secretKey },
+                    body: JSON.stringify({
+                        PlayFabId: playFabId,
+                        Keys: ["DeviceIntegrity_LastVerifyError", "DeviceIntegrity_VerifyErrorCount"]
+                    })
+                });
+                const current = currentResp.ok ? (await currentResp.json()).data?.Data || {} : {};
+                
+                await fetch(`https://${titleId}.playfabapi.com/Server/UpdateUserInternalData`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'X-SecretKey': secretKey },
+                    body: JSON.stringify({
+                        PlayFabId: playFabId,
+                        Data: {
+                            DeviceIntegrity_LastVerifyError: new Date().toISOString(),
+                            DeviceIntegrity_VerifyErrorCount: String((parseInt(current.DeviceIntegrity_VerifyErrorCount?.Value) || 0) + 1)
+                        },
+                        Permission: "Private"
+                    })
+                });
+            } catch (e) {
+                console.error("[VERIFY ERROR LOGGING FAILED]", e);
+            }
+        }
+
         // === Success ===
         const tokenResp = await fetch(`https://${titleId}.playfabapi.com/Admin/GetTitleInternalData`, {
             method: 'POST',
@@ -494,6 +472,7 @@ export default async function handler(req, res) {
 
 // === HELPERS ===
 function worstState(current, candidate, order) {
+    if (!candidate) return null;
     const scores = Object.fromEntries(order.map((s, i) => [s, i]));
     const curScore = current ? (scores[current] ?? 999) : 999;
     const candScore = scores[candidate] ?? 999;
