@@ -7,6 +7,7 @@ const ENFORCE_ATTESTATION = false; // ← FLIP TO TRUE WHEN READY
 
 // Verify attestation token with Meta's server-to-server API
 // Returns verified payload if valid, null if verification fails
+// Note: Meta only supports GET with query params (POST tested and rejected)
 async function verifyAttestationWithMeta(token, accessToken) {
     try {
         if (!token) return null;
@@ -16,36 +17,6 @@ async function verifyAttestationWithMeta(token, accessToken) {
         const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
 
         try {
-            // === TEST: Try POST with form body (preferred if it works) ===
-            console.log("[ATTESTATION TEST] Testing POST with form body...");
-            const postFormResp = await fetch(
-                "https://graph.oculus.com/platform_integrity/verify",
-                {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                    body: `token=${encodeURIComponent(token)}&access_token=${encodeURIComponent(accessToken)}`,
-                    signal: controller.signal
-                }
-            );
-            const postFormBody = await postFormResp.text();
-            console.log(`[ATTESTATION TEST] POST form - Status: ${postFormResp.status} | Body: ${postFormBody.slice(0, 300)}`);
-
-            // === TEST: Try POST with JSON body ===
-            console.log("[ATTESTATION TEST] Testing POST with JSON body...");
-            const postJsonResp = await fetch(
-                "https://graph.oculus.com/platform_integrity/verify",
-                {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ token, access_token: accessToken }),
-                    signal: controller.signal
-                }
-            );
-            const postJsonBody = await postJsonResp.text();
-            console.log(`[ATTESTATION TEST] POST JSON - Status: ${postJsonResp.status} | Body: ${postJsonBody.slice(0, 300)}`);
-
-            // === ACTUAL: Use GET with query params (known working) ===
-            console.log("[ATTESTATION TEST] Using GET with query params (production)...");
             const verifyResp = await fetch(
                 `https://graph.oculus.com/platform_integrity/verify?token=${encodeURIComponent(token)}&access_token=${encodeURIComponent(accessToken)}`,
                 { signal: controller.signal }
@@ -72,6 +43,9 @@ async function verifyAttestationWithMeta(token, accessToken) {
                 console.error(`[ATTESTATION VERIFY] Meta returned error:`, verifiedClaims.error);
                 return null;
             }
+
+            // DEBUG: Log full response to understand Alpha/Dev build states
+            console.log(`[ATTESTATION VERIFY] Meta response:`, JSON.stringify(verifiedClaims, null, 2));
 
             return verifiedClaims;
         } catch (e) {
