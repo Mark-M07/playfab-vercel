@@ -30,24 +30,41 @@ async function verifyAttestationWithMeta(token, accessToken) {
             }
 
             // Safely parse response
-            let verifiedClaims;
+            let response;
             try {
-                verifiedClaims = await verifyResp.json();
+                response = await verifyResp.json();
             } catch {
                 console.error("[ATTESTATION VERIFY] Non-JSON response from Meta");
                 return null;
             }
 
             // Check for error response from Meta
-            if (verifiedClaims.error) {
-                console.error(`[ATTESTATION VERIFY] Meta returned error:`, verifiedClaims.error);
+            if (response.error) {
+                console.error(`[ATTESTATION VERIFY] Meta returned error:`, response.error);
                 return null;
             }
 
-            // DEBUG: Log full response to understand Alpha/Dev build states
-            console.log(`[ATTESTATION VERIFY] Meta response:`, JSON.stringify(verifiedClaims, null, 2));
+            // Meta returns: { data: [{ message: "success", claims: "base64..." }] }
+            // We need to decode the claims from base64
+            const claimsB64 = response.data?.[0]?.claims;
+            if (!claimsB64) {
+                console.error("[ATTESTATION VERIFY] No claims in Meta response:", JSON.stringify(response));
+                return null;
+            }
 
-            return verifiedClaims;
+            // Decode base64 claims
+            let claims;
+            try {
+                const claimsJson = Buffer.from(claimsB64, 'base64').toString('utf-8');
+                claims = JSON.parse(claimsJson);
+            } catch (e) {
+                console.error("[ATTESTATION VERIFY] Failed to decode claims:", e.message);
+                return null;
+            }
+
+            console.log(`[ATTESTATION VERIFY] Decoded claims: app=${claims.app_state?.app_integrity_state} device=${claims.device_state?.device_integrity_state} package=${claims.app_state?.package_id}`);
+
+            return claims;
         } catch (e) {
             clearTimeout(timeoutId);
             if (e.name === 'AbortError') {
