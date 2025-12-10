@@ -35,44 +35,107 @@ async function verifyMetaAttestationToken(token) {
         if (!token) return false;
 
         const [headerB64, payloadB64, signatureB64] = token.split('.');
-        if (!headerB64 || !payloadB64 || !signatureB64) return false;
+        if (!headerB64 || !payloadB64 || !signatureB64) {
+            console.warn("[JWT VERIFY] Token is not a valid JWT format (missing parts)");
+            return false;
+        }
 
-        // Decode header to get kid
-        const header = JSON.parse(Buffer.from(headerB64.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString());
-        if (header.alg !== "RS256") return false;
+        // Decode header to get alg + kid
+        const headerJson = Buffer.from(
+            headerB64.replace(/-/g, '+').replace(/_/g, '/'),
+            'base64'
+        ).toString();
+        const header = JSON.parse(headerJson);
 
+        const alg = header.alg;
         const kid = header.kid;
-        if (!kid) return false;
 
-        // Meta's public JWKS (never changes)
+        if (!alg) {
+            console.warn("[JWT VERIFY] Missing alg in header");
+            return false;
+        }
+        if (!kid) {
+            console.warn("[JWT VERIFY] Missing kid in header");
+            return false;
+        }
+
+        if (alg === "PS256") {
+            // Meta is currently using PS256 (RSASSA-PSS + SHA-256)
+        } else if (alg === "RS256") {
+            // Some tokens might be RS256 in other contexts, so we allow both
+        } else {
+            console.warn("[JWT VERIFY] Unsupported alg:", alg);
+            return false;
+        }
+
+        // Fetch JWKS and find matching key
         const jwks = await getOculusJWKS();
-
         const key = jwks.keys.find(k => k.kid === kid);
-        if (!key) return false;
+        if (!key || !key.x5c || !key.x5c.length) {
+            console.error("[JWT VERIFY] No matching JWKS key for kid:", kid);
+            return false;
+        }
 
-        // Build PEM
-        const pem = 
-            "-----BEGIN PUBLIC KEY-----\n" +
-            key.x5c[0].match(/.{1,64}/g).join("\n") +
-            "\n-----END PUBLIC KEY-----";
+        // Build PEM from x5c certificate
+        const cert = key.x5c[0];
+        const pem = [
+            "-----BEGIN CERTIFICATE-----",
+            cert.match(/.{1,64}/g).join("\n"),
+            "-----END CERTIFICATE-----"
+        ].join("\n");
 
-        // Verify signature (Node.js built-in)
+        // Verify signature with SHA-256
         const verifier = crypto.createVerify('RSA-SHA256');
         verifier.update(`${headerB64}.${payloadB64}`);
-        const signature = signatureB64.replace(/-/g, '+').replace(/_/g, '/');
-        const validSignature = verifier.verify(pem, signature, 'base64');
+        verifier.end();
 
-        if (!validSignature) return false;
+        const signature = signatureB64
+            .replace(/-/g, '+')
+            .replace(/_/g, '/');
 
-        // Decode and validate claims
-        const payload = JSON.parse(Buffer.from(payloadB64.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString());
+        let verifyKey = pem;
+
+        // PS256 = RSASSA-PSS with SHA-256
+        if (alg === "PS256") {
+            verifyKey = {
+                key: pem,
+                padding: crypto.constants.RSA_PKCS1_PSS_PADDING,
+                saltLength: crypto.constants.RSA_PSS_SALTLEN_DIGEST
+            };
+        }
+        // RS256 uses default PKCS#1 v1.5 padding with the certificate pem
+
+        const validSignature = verifier.verify(verifyKey, signature, 'base64');
+        if (!validSignature) {
+            console.warn("[JWT VERIFY] Invalid signature");
+            return false;
+        }
+
+        // Decode payload
+        const payloadJson = Buffer.from(
+            payloadB64.replace(/-/g, '+').replace(/_/g, '/'),
+            'base64'
+        ).toString();
+        const payload = JSON.parse(payloadJson);
 
         // Standard JWT claims
         const now = Math.floor(Date.now() / 1000);
-        if (payload.exp && payload.exp < now) return false;
-        if (payload.iat && payload.iat > now + 300) return false;
-        if (payload.iss !== "https://www.oculus.com") return false;
-        if (!payload.aud?.includes("com.ContinuumXR.UG")) return false;
+        if (payload.exp && payload.exp < now) {
+            console.warn("[JWT VERIFY] Token expired");
+            return false;
+        }
+        if (payload.iat && payload.iat > now + 300) {
+            console.warn("[JWT VERIFY] Token issued in the future");
+            return false;
+        }
+        if (payload.iss !== "https://www.oculus.com") {
+            console.warn("[JWT VERIFY] Invalid iss:", payload.iss);
+            return false;
+        }
+        if (!payload.aud || !payload.aud.includes("com.ContinuumXR.UG")) {
+            console.warn("[JWT VERIFY] Invalid aud:", payload.aud);
+            return false;
+        }
 
         return payload; // Verified + valid
     } catch (e) {
