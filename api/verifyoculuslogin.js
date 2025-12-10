@@ -156,6 +156,38 @@ export default async function handler(req, res) {
         };
 
         if (attestationToken) {
+            console.log("========== ATTESTATION DEBUG START ==========");
+            console.log("Raw token type:", typeof attestationToken);
+            console.log("Raw token length:", attestationToken.length);
+
+            const tokenPreview = attestationToken.slice(0, 60);
+            console.log("Token preview (first 60 chars):", tokenPreview);
+
+            const tokenParts = attestationToken.split(".");
+            console.log("JWT part count:", tokenParts.length);
+
+            if (tokenParts.length === 3) {
+                try {
+                    const headerJson = Buffer.from(
+                        tokenParts[0].replace(/-/g, '+').replace(/_/g, '/'),
+                        'base64'
+                    ).toString();
+
+                    console.log("JWT header JSON:", headerJson);
+
+                    const header = JSON.parse(headerJson);
+                    console.log("JWT header.alg:", header.alg);
+                    console.log("JWT header.kid:", header.kid);
+
+                } catch (e) {
+                    console.error("JWT header decode failed:", e.message);
+                }
+            } else {
+                console.warn("Token is NOT a valid JWT format (not 3 parts)");
+            }
+
+            console.log("========== ATTESTATION DEBUG END ==========");
+
             const verifiedPayload = await verifyMetaAttestationToken(attestationToken);
 
             if (!verifiedPayload) {
