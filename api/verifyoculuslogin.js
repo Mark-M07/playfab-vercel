@@ -88,39 +88,59 @@ export default async function handler(req, res) {
         }
 
         // === Attestation Validation ===
-        let attestationResult = { valid: true, reason: "no_token", app_integrity: "unknown", device_integrity: "unknown" };
+        let attestationResult = {
+            valid: true,
+            reason: "no_token",
+            app_integrity: "unknown",
+            device_integrity: "unknown"
+        };
 
         if (attestationToken) {
             try {
                 const parts = attestationToken.split('.');
-                if (parts.length !== 3) throw new Error("Malformed");
+                if (parts.length !== 3) throw new Error("Malformed JWT");
 
                 const payloadRaw = Buffer.from(parts[1].replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf-8');
                 const payload = JSON.parse(payloadRaw);
 
+                // === Extract raw values for logging/forensics ===
+                const rawAppState = payload.app_state?.app_integrity_state || "unknown";
+                const rawDeviceState = payload.device_state?.device_integrity_state || "unknown";
+
+                // === Nonce verification (anti-replay) ===
                 const expectedNonce = crypto.createHash('sha256')
                     .update(nonce)
                     .digest('base64')
-                    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+                    .replace(/\+/g, '-')
+                    .replace(/\//g, '_')
+                    .replace(/=+$/, '');
 
-                const valid = payload.request_details?.nonce === expectedNonce &&
-                              payload.app_state?.package_id === "com.ContinuumXR.UG" &&
-                              ["StoreRecognized", "NotEvaluated"].includes(payload.app_state?.app_integrity_state) &&
-                              ["Advanced", "Basic"].includes(payload.device_state?.device_integrity_state) &&
-                              Math.abs(Date.now()/1000 - (payload.request_details?.timestamp || 0)) < 300;
+                const nonceOk = payload.request_details?.nonce === expectedNonce;
+                const packageOk = payload.app_state?.package_id === "com.ContinuumXR.UG";
+                const fresh = Math.abs(Date.now() / 1000 - (payload.request_details?.timestamp || 0)) < 300;
 
-                attestationResult = {
-                    valid,
-                    reason: valid ? "ok" : "validation_failed",
-                    app_integrity: payload.app_state?.app_integrity_state || "unknown",
-                    device_integrity: payload.device_state?.device_integrity_state || "unknown"
-                };
+                // === STRICT PRODUCTION RULES ===
+                const strictAppOk = rawAppState === "StoreRecognized";
+                const strictDeviceOk = rawDeviceState === "Advanced";
 
-                if (!valid) {
-                    console.warn(`[ATTESTATION FAILED] User:${metaId} App:${attestationResult.app_integrity} Device:${attestationResult.device_integrity}`);
+                // Final validity
+                attestationResult.valid = nonceOk && packageOk && strictAppOk && strictDeviceOk && fresh;
+                attestationResult.reason = attestationResult.valid ? "ok" : "strict_validation_failed";
+                attestationResult.app_integrity = rawAppState;
+                attestationResult.device_integrity = rawDeviceState;
+
+                if (!attestationResult.valid) {
+                    console.warn(`[ATTESTATION FAILED] User:${metaId} | Reason:${attestationResult.reason} | RawApp:${rawAppState} | RawDevice:${rawDeviceState}`);
                 }
+
             } catch (e) {
-                attestationResult = { valid: false, reason: "parse_error" };
+                console.error(`[ATTESTATION PARSE ERROR] User:${metaId} | Error: ${e.message}`);
+                attestationResult = {
+                    valid: false,
+                    reason: "parse_error",
+                    app_integrity: "error",
+                    device_integrity: "error"
+                };
             }
         }
 
@@ -170,44 +190,72 @@ export default async function handler(req, res) {
             return res.status(400).json({ success: false, error: 'Authentication failed' });
         }
 
-        // === ENFORCEMENT: PERMA-BAN ON ATTESTATION FAILURE ===
+        // === ENFORCEMENT: PERMA-BAN ON ATTESTATION FAILURE (with Developer Bypass) ===
         if (ENFORCE_ATTESTATION) {
             if (!attestationToken) {
-                // Someone is running an old or modified client
-                // Block login, but DO NOT ban (yet) — this avoids false positives
                 return res.status(403).json({
                     success: false,
                     error: "UpdateRequired",
-                    errorMessage: "A new game update is required to play.",
+                    errorMessage: "A new game update is required to play."
                 });
             }
 
             if (!attestationResult.valid) {
-                console.warn(`[ATTESTATION BAN] Banning PlayFabId:${playfabData.data.PlayFabId} MetaId:${metaId} Reason:${attestationResult.reason}`);
-
-                try {
-                    await fetch(`https://${titleId}.playfabapi.com/Server/BanUsers`, {
+                // === DEVELOPER BYPASS: Allow NotEvaluated only for flagged devs ===
+                if (attestationResult.app_integrity === "NotEvaluated") {
+                    const devResp = await fetch(`https://${titleId}.playfabapi.com/Server/GetUserInternalData`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json', 'X-SecretKey': secretKey },
                         body: JSON.stringify({
-                            Bans: [{
-                                PlayFabId: playfabData.data.PlayFabId,
-                                Reason: "Security violation – modified client",
-                                Hours: 0
-                            }]
+                            PlayFabId: playfabData.data.PlayFabId,
+                            Keys: ["IsDeveloper"]
                         })
                     });
-                } catch (e) {
-                    console.error("[BAN FAILED]", e);
+
+                    if (devResp.ok) {
+                        const data = await devResp.json();
+                        if (data.data?.Data?.IsDeveloper === "true") {
+                            console.log(`[DEVELOPER BYPASS] Allowing NotEvaluated for dev account: ${metaId}`);
+                            // → Allow login, skip ban
+                            // Continue to success path
+                        } else {
+                            // Not a dev → pirated/sideloaded → BAN
+                            console.warn(`[ATTESTATION BAN] Non-dev with NotEvaluated: ${metaId}`);
+                            // → fall through to ban
+                        }
+                    }
                 }
 
-                return res.status(403).json({
-                    success: false,
-                    error: "AccountBanned",
-                    errorCode: 1002,
-                    errorMessage: "Unable to authenticate. Please try again later.",
-                    banInfo: { reason: "Security violation", expiry: "Indefinite" }
-                });
+                // === ALL OTHER FAILURES = PERMA-BAN ===
+                if (attestationResult.app_integrity !== "NotEvaluated" || 
+                    !(await isDeveloper(playfabData.data.PlayFabId))) {  // helper or inline check
+
+                    console.warn(`[ATTESTATION BAN] Banning PlayFabId:${playfabData.data.PlayFabId} | App:${attestationResult.app_integrity} | Device:${attestationResult.device_integrity}`);
+
+                    try {
+                        await fetch(`https://${titleId}.playfabapi.com/Server/BanUsers`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json', 'X-SecretKey': secretKey },
+                            body: JSON.stringify({
+                                Bans: [{
+                                    PlayFabId: playfabData.data.PlayFabId,
+                                    Reason: "Security violation – tampered client",
+                                    Hours: 0
+                                }]
+                            })
+                        });
+                    } catch (e) {
+                        console.error("[BAN FAILED]", e);
+                    }
+
+                    return res.status(403).json({
+                        success: false,
+                        error: "AccountBanned",
+                        errorCode: 1002,
+                        errorMessage: "Unable to authenticate. Please try again later.",
+                        banInfo: { reason: "Security violation", expiry: "Indefinite" }
+                    });
+                }
             }
         }
 
