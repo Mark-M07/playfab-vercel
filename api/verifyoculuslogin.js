@@ -3,6 +3,8 @@ import fetch from 'node-fetch';
 import querystring from 'node:querystring';
 import crypto from 'crypto';
 
+const KNOWN_APP_STATES = ["NotRecognized", "NotEvaluated", "StoreRecognized"];
+const KNOWN_DEVICE_STATES = ["NotTrusted", "Basic", "Advanced"];
 const ENFORCE_ATTESTATION = false; // ← FLIP TO TRUE WHEN READY
 
 // Verify attestation token with Meta's server-to-server API
@@ -62,8 +64,6 @@ async function verifyAttestationWithMeta(token, accessToken) {
                 return null;
             }
 
-            console.log(`[ATTESTATION VERIFY] Decoded claims: app=${claims.app_state?.app_integrity_state} device=${claims.device_state?.device_integrity_state} package=${claims.app_state?.package_id}`);
-
             return claims;
         } catch (e) {
             clearTimeout(timeoutId);
@@ -114,13 +114,13 @@ export default async function handler(req, res) {
 
         const { userId: receivedUserId, nonce, attestationToken } = bodyData;
         if (!receivedUserId || !nonce) {
-            return res.status(400).json({ success: false, error: 'Authentication failed' });
+            return res.status(400).json({ success: false, error: "Unable to authenticate. Please try again." });
         }
 
         // === Extract Meta ID (strip legacy appInstanceHash if present) ===
         const metaId = receivedUserId.includes('|') ? receivedUserId.split('|')[0] : receivedUserId;
         if (!/^\d+$/.test(metaId)) {
-            return res.status(400).json({ success: false, error: 'Authentication failed' });
+            return res.status(400).json({ success: false, error: "Unable to authenticate. Please try again." });
         }
 
         // === Oculus Nonce Validation ===
@@ -157,17 +157,16 @@ export default async function handler(req, res) {
             return res.status(503).json({ success: false, error: 'Service temporarily unavailable' });
         }
         
-        // 5.3: Safer parse of oculusBody
         let nonceValidateResult;
         try {
             nonceValidateResult = JSON.parse(oculusBody);
         } catch {
             console.error("[NONCE VALIDATE] Non-JSON response:", oculusBody.slice(0, 200));
-            return res.status(400).json({ success: false, error: 'Authentication failed' });
+            return res.status(400).json({ success: false, error: "Unable to authenticate. Please try again." });
         }
 
         if (!oculusResp.ok || !nonceValidateResult.is_valid) {
-            return res.status(400).json({ success: false, error: 'Authentication failed' });
+            return res.status(400).json({ success: false, error: "Unable to authenticate. Please try again." });
         }
 
         // === META ATTESTATION VALIDATION (Server-to-Server with Meta) ===
@@ -189,7 +188,6 @@ export default async function handler(req, res) {
                 attestation.reason = "verification_failed";
                 console.warn(`[ATTESTATION] Meta verification failed for user: ${metaId}`);
                 
-                // 5.2: Treat verification failures softly - don't call it "AccountBanned"
                 // This could be a Meta outage or misconfiguration, not necessarily cheating
                 if (ENFORCE_ATTESTATION) {
                     return res.status(403).json({
@@ -208,6 +206,11 @@ export default async function handler(req, res) {
                 attestation.device_integrity = rawDevice;
                 attestation.unique_id = payload.device_state?.unique_id || null;
                 attestation.device_ban = payload.device_ban || null;
+
+                // Unexpected integrity state — warn if Meta adds new values
+                if (!KNOWN_APP_STATES.includes(rawApp) || !KNOWN_DEVICE_STATES.includes(rawDevice)) {
+                    console.warn(`[ATTESTATION] UNKNOWN INTEGRITY STATE FROM META → App:${rawApp} Device:${rawDevice} MetaId:${metaId}`);
+                }
 
                 // Meta device ban check
                 if (attestation.device_ban?.is_banned === true) {
@@ -273,7 +276,6 @@ export default async function handler(req, res) {
         const playfabData = await playfabResp.json();
 
         if (!playfabResp.ok) {
-            // 5.1: Cleaned up - removed dead "invalid_signature_or_claims" check
             // Only apply Meta device ban if we have a verified unique_id and user is PlayFab banned
             if (playfabData.errorCode === 1002 && attestation.unique_id) {
                 await banDeviceViaMeta(attestation.unique_id, oculusAccessToken);
@@ -282,7 +284,7 @@ export default async function handler(req, res) {
                 success: false,
                 error: playfabData.errorCode === 1002 ? "AccountBanned" : "Authentication failed",
                 errorCode: playfabData.errorCode || 0,
-                errorMessage: "Unable to authenticate. Please try again later.",
+                errorMessage: "Unable to authenticate. Please try again.",
                 banInfo: playfabData.errorCode === 1002 ? { reason: "Security violation", expiry: "Indefinite" } : undefined
             });
         }
@@ -346,7 +348,7 @@ export default async function handler(req, res) {
                         success: false,
                         error: "AccountBanned",
                         errorCode: 1002,
-                        errorMessage: "Unable to authenticate. Please try again later.",
+                        errorMessage: "Unable to authenticate. Please try again.",
                         banInfo: { reason: "Security violation", expiry: "Indefinite" }
                     });
                 }
@@ -378,13 +380,35 @@ export default async function handler(req, res) {
             updates.DeviceIntegrity_FailCount = String((parseInt(current.DeviceIntegrity_FailCount?.Value) || 0) + 1);
             updates.DeviceIntegrity_EverFailed = "true";
 
-            const worstApp = worstState(current.DeviceIntegrity_WorstAppState?.Value, attestation.app_integrity,
-                ["unknown", "error", "NotRecognized", "NotEvaluated", "StoreRecognized"]);
-            const worstDevice = worstState(current.DeviceIntegrity_WorstDeviceState?.Value, attestation.device_integrity,
-                ["unknown", "error", "NotTrusted", "Basic", "Advanced"]);
+            // Severity order for worstState(): index 0 = worst, higher index = better
+            const appOrder    = KNOWN_APP_STATES;
+            const deviceOrder = KNOWN_DEVICE_STATES;
 
-            if (worstApp) updates.DeviceIntegrity_WorstAppState = worstApp;
-            if (worstDevice) updates.DeviceIntegrity_WorstDeviceState = worstDevice;
+            const severityApp = appOrder.includes(attestation.app_integrity) 
+                ? attestation.app_integrity 
+                : "NotRecognized";
+
+            const severityDevice = deviceOrder.includes(attestation.device_integrity) 
+                ? attestation.device_integrity 
+                : "NotTrusted";
+
+            const worstApp = worstState(
+                current.DeviceIntegrity_WorstAppState?.Value,
+                severityApp,
+                appOrder
+            );
+            const worstDevice = worstState(
+                current.DeviceIntegrity_WorstDeviceState?.Value,
+                severityDevice,
+                deviceOrder
+            );
+
+            if (worstApp) {
+                updates.DeviceIntegrity_WorstAppState = worstApp;
+            }
+            if (worstDevice) {
+                updates.DeviceIntegrity_WorstDeviceState = worstDevice;
+            }
 
             const existing = (current.DeviceIntegrity_FailReasons?.Value || "").split("|").filter(Boolean);
             const newReasons = attestation.reason.split("|").filter(r => !existing.includes(r));
