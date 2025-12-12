@@ -5,7 +5,66 @@ import crypto from 'crypto';
 
 const KNOWN_APP_STATES = ["NotRecognized", "NotEvaluated", "StoreRecognized"];
 const KNOWN_DEVICE_STATES = ["NotTrusted", "Basic", "Advanced"];
-const ENFORCE_ATTESTATION = false; // ← FLIP TO TRUE WHEN READY
+
+// === ENFORCEMENT CONFIGURATION ===
+// Action types: "allow" | "block" | "ban"
+//   - allow: Let login proceed (monitoring only)
+//   - block: Reject this login attempt but don't ban
+//   - ban:   Reject login AND issue permanent PlayFab + Meta device ban
+const ENFORCEMENT_CONFIG = {
+  enabled: false, // Master switch - set to true to enable enforcement
+  
+  // Device integrity failures
+  device_NotTrusted: "ban",     // Worst - definitely compromised
+  device_Basic: "ban",          // Bad - rooted/modified device
+  
+  // Token/timing issues  
+  token_stale: "block",         // Block login but don't ban (could be clock issues)
+  
+  // App integrity failures
+  app_NotRecognized: "ban",     // Sideloaded/pirated APK
+  app_NotEvaluated: "ban",      // Ban non-devs (isDeveloper check handles legitimate devs)
+  
+  // Certificate mismatch
+  cert_mismatch: "ban",         // Modified APK
+  cert_missing: "ban",          // Missing cert data
+  
+  // Nonce/package issues (likely tampering)
+  nonce_mismatch: "ban",
+  package_mismatch: "ban",
+  
+  // Meta API couldn't verify token
+  verification_failed: "block", // Block but don't ban (could be API issue)
+  
+  // No attestation token provided (old client)
+  no_token: "block",            // Require updated client
+};
+
+// Helper to determine action for a given failure
+function getEnforcementAction(failReasons) {
+  if (!ENFORCEMENT_CONFIG.enabled) return "allow";
+  
+  const reasons = failReasons.split("|");
+  let action = "allow";
+  
+  for (const reason of reasons) {
+    // Map reason to config key
+    let configKey = reason;
+    
+    // Handle device_X and app_X patterns
+    if (reason.startsWith("device_")) configKey = reason;
+    else if (reason.startsWith("app_")) configKey = reason;
+    else if (reason.startsWith("cert_")) configKey = reason;
+    
+    const reasonAction = ENFORCEMENT_CONFIG[configKey];
+    
+    // Escalate: ban > block > allow
+    if (reasonAction === "ban") return "ban"; // Immediate escalation
+    if (reasonAction === "block" && action !== "ban") action = "block";
+  }
+  
+  return action;
+}
 
 // APK Certificate Validation Config
 // SHA256 hash of your release signing certificate (lowercase, no colons)
@@ -362,11 +421,14 @@ export default async function handler(req, res) {
     return res.status(500).json({ success: false, error: 'Server misconfigured' });
   }
 
-  try {
-    if (req.method !== 'POST') {
-      return res.status(405).json({ success: false, error: 'Method Not Allowed' });
-    }
+  if (req.method === "GET" || req.method === "HEAD") {
+    return res.status(204).end();
+  }
+  if (req.method !== "POST") {
+    return res.status(405).json({ success: false, error: "Method Not Allowed" });
+  }
 
+  try {
     // === Parse body ===
     let bodyData;
     const contentType = req.headers['content-type'] || '';
@@ -457,15 +519,6 @@ export default async function handler(req, res) {
       if (!payload) {
         attestation.reason = "verification_failed";
         console.warn(`[ATTESTATION] Meta verification failed for user: ${metaId}`);
-
-        if (ENFORCE_ATTESTATION) {
-          return res.status(403).json({
-            success: false,
-            error: "VerificationFailed",
-            errorCode: 1003,
-            errorMessage: "Unable to verify device. Please try again later."
-          });
-        }
       } else {
         const rawApp = payload.app_state?.app_integrity_state || "unknown";
         const rawDevice = payload.device_state?.device_integrity_state || "unknown";
@@ -484,12 +537,12 @@ export default async function handler(req, res) {
 
         // Meta device ban check
         if (attestation.device_ban?.is_banned === true) {
-          console.warn(`[META DEVICE BANNED] User:${metaId} | UniqueId:${attestation.unique_id}`);
+          console.warn(`[META DEVICE BANNED] User:${metaId}`);
           return res.status(403).json({
             success: false,
             error: "AccountBanned",
             errorCode: 1002,
-            errorMessage: "This device is permanently banned.",
+            errorMessage: "This device is banned.",
             banInfo: { reason: "Device banned", expiry: attestation.device_ban.remaining_ban_time || "Permanent" }
           });
         }
@@ -617,19 +670,41 @@ export default async function handler(req, res) {
     }
 
     // === FINAL ENFORCEMENT ===
-    if (ENFORCE_ATTESTATION) {
+    if (ENFORCEMENT_CONFIG.enabled) {
+      // Handle missing attestation token
       if (!attestationToken) {
-        return res.status(403).json({
-          success: false,
-          error: "UpdateRequired",
-          errorMessage: "A new game update is required to play."
-        });
+        const noTokenAction = getEnforcementAction("no_token");
+        if (noTokenAction !== "allow") {
+          console.warn(`[ATTESTATION BLOCKED] No token | MetaId:${metaId} | Action:${noTokenAction}`);
+          return res.status(403).json({
+            success: false,
+            error: "UpdateRequired",
+            errorMessage: "A new game update is required to play."
+          });
+        }
       }
 
-      if (!attestation.valid && attestation.reason !== "verification_failed") {
-        let allow = false;
+      // Handle verification failures (Meta API couldn't verify)
+      if (attestation.reason === "verification_failed") {
+        const verifyAction = getEnforcementAction("verification_failed");
+        if (verifyAction !== "allow") {
+          console.warn(`[ATTESTATION BLOCKED] Verification failed | MetaId:${metaId} | Action:${verifyAction}`);
+          return res.status(403).json({
+            success: false,
+            error: "VerificationFailed",
+            errorCode: 1003,
+            errorMessage: "Unable to verify device. Please try again later."
+          });
+        }
+      }
 
-        if (attestation.app_integrity === "NotEvaluated") {
+      // Handle attestation failures with tiered enforcement
+      if (!attestation.valid && attestation.reason !== "verification_failed") {
+        const action = getEnforcementAction(attestation.reason);
+        
+        // Developer bypass for NotEvaluated
+        let allow = action === "allow";
+        if (!allow && attestation.app_integrity === "NotEvaluated") {
           const isDev = await isDeveloper(masterPlayFabId, titleId, secretKey);
           if (isDev) {
             console.log(`[DEV BYPASS] Allowing NotEvaluated for developer: ${metaId}`);
@@ -638,42 +713,46 @@ export default async function handler(req, res) {
         }
 
         if (!allow) {
-          console.warn(`[ATTESTATION BAN] PlayFabId:${masterPlayFabId} | MetaId:${metaId} | App:${attestation.app_integrity} | Device:${attestation.device_integrity} | Cert:${attestation.cert_check?.reason || 'n/a'}`);
+          console.warn(`[ATTESTATION ${action.toUpperCase()}] PlayFabId:${masterPlayFabId} | MetaId:${metaId} | App:${attestation.app_integrity} | Device:${attestation.device_integrity} | Reasons:${attestation.reason} | Action:${action}`);
 
-          // PlayFab permanent ban for attestation failures
-          try {
-            await fetch(`https://${titleId}.playfabapi.com/Server/BanUsers`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json', 'X-SecretKey': secretKey },
-              body: JSON.stringify({
-                Bans: [{ PlayFabId: masterPlayFabId, Reason: `Attestation: ${attestation.reason}` }]
-              })
-            });
-          } catch (e) {
-            console.error("[PLAYFAB BAN FAILED]", e);
+          // Only ban if action is "ban" (not "block")
+          if (action === "ban") {
+            // PlayFab permanent ban
+            try {
+              await fetch(`https://${titleId}.playfabapi.com/Server/BanUsers`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'X-SecretKey': secretKey },
+                body: JSON.stringify({
+                  Bans: [{ PlayFabId: masterPlayFabId, Reason: `Attestation: ${attestation.reason}` }]
+                })
+              });
+            } catch (e) {
+              console.error("[PLAYFAB BAN FAILED]", e);
+            }
+
+            // Meta permanent hardware ban (store in Security blob)
+            if (attestation.unique_id) {
+              const blob = await ensureBlob();
+              const metaBan = await banDeviceAndRecord(attestation.unique_id, oculusAccessToken, 52560000, {
+                titleId,
+                secretKey,
+                playFabId: masterPlayFabId,
+                blob,
+                banReason: `Attestation: ${attestation.reason}`,
+                metaId
+              });
+              if (metaBan.success && metaBan.recorded) securityDirty = true;
+            }
           }
 
-          // Meta permanent hardware ban (store in Security blob)
-          if (attestation.unique_id) {
-            const blob = await ensureBlob();
-            const metaBan = await banDeviceAndRecord(attestation.unique_id, oculusAccessToken, 52560000, {
-              titleId,
-              secretKey,
-              playFabId: masterPlayFabId,
-              blob,
-              banReason: `Attestation: ${attestation.reason}`,
-              metaId
-            });
-            if (metaBan.success && metaBan.recorded) securityDirty = true;
-          }
-
-          // Also record enforcement as a failure in the blob for investigators
+          // Record enforcement in blob for investigators (both block and ban)
           {
             const blob = await ensureBlob();
             if (blob) {
               const now = new Date().toISOString();
               const di = blob.di || (blob.di = {});
               di.lastEnforce = now;
+              di.lastAction = action; // Record whether it was block or ban
               blob.lua = now;
               securityDirty = true;
             } else {
@@ -685,18 +764,29 @@ export default async function handler(req, res) {
             try { await saveSecurityBlob(titleId, secretKey, masterPlayFabId, securityBlob); } catch {}
           }
 
-          return res.status(403).json({
-            success: false,
-            error: "AccountBanned",
-            errorCode: 1002,
-            errorMessage: "Unable to authenticate. Please try again.",
-            banInfo: { reason: "Security violation", expiry: "Indefinite" }
-          });
+          // Return appropriate error based on action type
+          if (action === "ban") {
+            return res.status(403).json({
+              success: false,
+              error: "AccountBanned",
+              errorCode: 1002,
+              errorMessage: "Unable to authenticate. Please try again.",
+              banInfo: { reason: "Security violation", expiry: "Indefinite" }
+            });
+          } else {
+            // action === "block" - reject but don't ban
+            return res.status(403).json({
+              success: false,
+              error: "AuthenticationBlocked",
+              errorCode: 1004,
+              errorMessage: "Unable to authenticate. Please try again later."
+            });
+          }
         }
       }
     }
 
-    // === FORENSIC LOGGING (v2 – final fixed version) ===
+    // === FORENSIC LOGGING ===
     if (attestationToken && !attestation.valid && attestation.reason !== "verification_failed") {
       const now = new Date().toISOString();
       const blob = await ensureBlob();
@@ -748,7 +838,6 @@ export default async function handler(req, res) {
         }
         di.rm = rm;
 
-        // Rest of your existing code (unique_id, cert, etc.) is safe
         if (attestation.unique_id) di.uid = attestation.unique_id;
         if (attestation.cert_check?.clientHash) di.ch = attestation.cert_check.clientHash;
         if (attestation.cert_check?.reason === "cert_mismatch") {
