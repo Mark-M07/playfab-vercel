@@ -4,7 +4,7 @@ import crypto from 'crypto';
 /**
  * API Module for automated token rotation
  * Generates and stores a new validation token in PlayFab Title Data (public)
- * Called via Vercel Cron every 3 hours
+ * Called via Vercel Cron every 1 hour
  * Requires PLAYFAB_TITLE_ID, PLAYFAB_DEV_SECRET_KEY env vars
  * @route GET /api/rotatetoken
  */

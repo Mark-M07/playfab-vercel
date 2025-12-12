@@ -1,4 +1,8 @@
 // api/verifyoculuslogin.js
+// Updated with:
+// - package_cert_sha256_digest validation (single hash, monitoring mode)
+// - Proper ban info extraction from PlayFab error response
+// - Meta ban duration matching PlayFab ban duration
 import fetch from 'node-fetch';
 import querystring from 'node:querystring';
 import crypto from 'crypto';
@@ -7,16 +11,19 @@ const KNOWN_APP_STATES = ["NotRecognized", "NotEvaluated", "StoreRecognized"];
 const KNOWN_DEVICE_STATES = ["NotTrusted", "Basic", "Advanced"];
 const ENFORCE_ATTESTATION = false; // ← FLIP TO TRUE WHEN READY
 
+// APK Certificate Validation Config
+// SHA256 hash of your release signing certificate (lowercase, no colons)
+// Get this from your first successful attestation log or from your keystore
+// Leave empty to monitor without validation (will log all cert hashes)
+const VALID_CERT_HASH = (process.env.VALID_CERT_HASH || "").trim().toLowerCase();
+
 // Verify attestation token with Meta's server-to-server API
-// Returns verified payload if valid, null if verification fails
-// Note: Meta only supports GET with query params (POST tested and rejected)
 async function verifyAttestationWithMeta(token, accessToken) {
     try {
         if (!token) return null;
 
-        // Add timeout to prevent hanging requests
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
+        const timeoutId = setTimeout(() => controller.abort(), 10000);
 
         try {
             const verifyResp = await fetch(
@@ -31,7 +38,6 @@ async function verifyAttestationWithMeta(token, accessToken) {
                 return null;
             }
 
-            // Safely parse response
             let response;
             try {
                 response = await verifyResp.json();
@@ -40,21 +46,17 @@ async function verifyAttestationWithMeta(token, accessToken) {
                 return null;
             }
 
-            // Check for error response from Meta
             if (response.error) {
                 console.error(`[ATTESTATION VERIFY] Meta returned error:`, response.error);
                 return null;
             }
 
-            // Meta returns: { data: [{ message: "success", claims: "base64..." }] }
-            // We need to decode the claims from base64
             const claimsB64 = response.data?.[0]?.claims;
             if (!claimsB64) {
                 console.error("[ATTESTATION VERIFY] No claims in Meta response:", JSON.stringify(response));
                 return null;
             }
 
-            // Decode base64 claims
             let claims;
             try {
                 const claimsJson = Buffer.from(claimsB64, 'base64').toString('utf-8');
@@ -80,8 +82,131 @@ async function verifyAttestationWithMeta(token, accessToken) {
     }
 }
 
+/**
+ * Validates the APK signing certificate hash against the expected hash.
+ */
+function validateCertificate(certHashes) {
+    const result = {
+        valid: true,
+        reason: "ok",
+        clientHash: null
+    };
+
+    if (!certHashes || !Array.isArray(certHashes) || certHashes.length === 0) {
+        result.valid = false;
+        result.reason = "no_cert_in_payload";
+        return result;
+    }
+
+    result.clientHash = certHashes[0].toLowerCase();
+
+    if (!VALID_CERT_HASH) {
+        result.reason = "no_expected_hash_configured";
+        console.log(`[CERT CHECK] No expected hash configured. Client cert: ${result.clientHash}`);
+        return result;
+    }
+
+    if (result.clientHash !== VALID_CERT_HASH) {
+        result.valid = false;
+        result.reason = "cert_mismatch";
+    }
+
+    return result;
+}
+
+/**
+ * Extracts ban info from PlayFab error response.
+ * PlayFab format: { errorDetails: { "BanReason": ["ExpiryDateOrIndefinite"] } }
+ * Returns { reason, expiry, durationMinutes }
+ */
+function extractBanInfo(playfabErrorResponse) {
+    const result = {
+        reason: "Account suspended",
+        expiry: "Indefinite",
+        durationMinutes: 52560000 // 100 years (permanent)
+    };
+
+    try {
+        // PlayFab errorDetails format: { "ReasonString": ["ExpiryValue"] }
+        // The KEY is the ban reason, the VALUE array contains the expiry
+        const errorDetails = playfabErrorResponse.errorDetails;
+        
+        if (errorDetails && typeof errorDetails === 'object') {
+            const reasons = Object.keys(errorDetails);
+            if (reasons.length > 0) {
+                result.reason = reasons[0]; // The key IS the reason
+                
+                const expiryArray = errorDetails[reasons[0]];
+                if (Array.isArray(expiryArray) && expiryArray.length > 0) {
+                    result.expiry = expiryArray[0]; // First element is expiry
+                }
+            }
+        }
+
+        // Calculate duration in minutes for Meta API
+        if (result.expiry && result.expiry !== "Indefinite") {
+            try {
+                const expiryDate = new Date(result.expiry);
+                const now = new Date();
+                const diffMs = expiryDate.getTime() - now.getTime();
+                
+                if (diffMs > 0) {
+                    result.durationMinutes = Math.min(
+                        Math.ceil(diffMs / (1000 * 60)),
+                        52560000 // Cap at 100 years
+                    );
+                } else {
+                    // Ban already expired
+                    result.durationMinutes = 1;
+                }
+            } catch (e) {
+                console.error('[extractBanInfo] Failed to parse expiry date:', result.expiry);
+                // Keep permanent duration if parsing fails
+            }
+        }
+
+        return result;
+    } catch (e) {
+        console.error('[extractBanInfo] Error:', e);
+        return result;
+    }
+}
+
+/**
+ * Bans a device via Meta's API with specified duration.
+ */
+async function banDeviceViaMeta(uniqueId, accessToken, durationMinutes = 52560000) {
+    try {
+        const resp = await fetch('https://graph.oculus.com/platform_integrity/device_ban', {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${accessToken}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                unique_id: uniqueId,
+                is_banned: true,
+                remaining_time_in_minute: durationMinutes
+            })
+        });
+
+        const data = await resp.json();
+
+        if (data.message === "Success" && data.ban_id) {
+            const durationDisplay = durationMinutes >= 52560000 ? 'PERMANENT' : `${durationMinutes} minutes`;
+            console.log(`[META DEVICE BAN] Success | UniqueId:${uniqueId} | Duration:${durationDisplay} | BanId:${data.ban_id}`);
+            return { success: true, banId: data.ban_id };
+        } else {
+            console.error(`[META DEVICE BAN FAILED]`, data);
+            return { success: false, error: data };
+        }
+    } catch (e) {
+        console.error(`[META DEVICE BAN ERROR]`, e);
+        return { success: false, error: e.message };
+    }
+}
+
 export default async function handler(req, res) {
-    // Config
     const titleId = process.env.PLAYFAB_TITLE_ID;
     const secretKey = process.env.PLAYFAB_DEV_SECRET_KEY;
     const appId = process.env.OCULUS_APP_ID;
@@ -117,7 +242,7 @@ export default async function handler(req, res) {
             return res.status(400).json({ success: false, error: "Unable to authenticate. Please try again." });
         }
 
-        // === Extract Meta ID (strip legacy appInstanceHash if present) ===
+        // === Extract Meta ID ===
         const metaId = receivedUserId.includes('|') ? receivedUserId.split('|')[0] : receivedUserId;
         if (!/^\d+$/.test(metaId)) {
             return res.status(400).json({ success: false, error: "Unable to authenticate. Please try again." });
@@ -125,7 +250,7 @@ export default async function handler(req, res) {
 
         // === Oculus Nonce Validation ===
         const nonceController = new AbortController();
-        const nonceTimeoutId = setTimeout(() => nonceController.abort(), 10000); // 10 second timeout
+        const nonceTimeoutId = setTimeout(() => nonceController.abort(), 10000);
         
         let oculusResp;
         let oculusBody;
@@ -169,36 +294,33 @@ export default async function handler(req, res) {
             return res.status(400).json({ success: false, error: "Unable to authenticate. Please try again." });
         }
 
-        // === META ATTESTATION VALIDATION (Server-to-Server with Meta) ===
+        // === META ATTESTATION VALIDATION ===
         let attestation = {
             valid: false,
             reason: "no_token",
             app_integrity: null,
             device_integrity: null,
             unique_id: null,
-            device_ban: null
+            device_ban: null,
+            cert_check: null
         };
 
         if (attestationToken) {
-            // Call Meta's verification API - this is the ONLY secure way
             const payload = await verifyAttestationWithMeta(attestationToken, oculusAccessToken);
 
             if (!payload) {
-                // Meta couldn't verify the token - could be forged, expired, or API error
                 attestation.reason = "verification_failed";
                 console.warn(`[ATTESTATION] Meta verification failed for user: ${metaId}`);
                 
-                // This could be a Meta outage or misconfiguration, not necessarily cheating
                 if (ENFORCE_ATTESTATION) {
                     return res.status(403).json({
                         success: false,
                         error: "VerificationFailed",
-                        errorCode: 1003, // Different from 1002 (AccountBanned)
+                        errorCode: 1003,
                         errorMessage: "Unable to verify device. Please try again later."
                     });
                 }
             } else {
-                // Meta verified the token - now we can trust the claims
                 const rawApp = payload.app_state?.app_integrity_state || "unknown";
                 const rawDevice = payload.device_state?.device_integrity_state || "unknown";
 
@@ -207,9 +329,13 @@ export default async function handler(req, res) {
                 attestation.unique_id = payload.device_state?.unique_id || null;
                 attestation.device_ban = payload.device_ban || null;
 
-                // Unexpected integrity state — warn if Meta adds new values
+                // Certificate validation
+                attestation.cert_check = validateCertificate(
+                    payload.app_state?.package_cert_sha256_digest
+                );
+
                 if (!KNOWN_APP_STATES.includes(rawApp) || !KNOWN_DEVICE_STATES.includes(rawDevice)) {
-                    console.warn(`[ATTESTATION] UNKNOWN INTEGRITY STATE FROM META → App:${rawApp} Device:${rawDevice} MetaId:${metaId}`);
+                    console.warn(`[ATTESTATION] UNKNOWN INTEGRITY STATE → App:${rawApp} Device:${rawDevice} MetaId:${metaId}`);
                 }
 
                 // Meta device ban check
@@ -232,14 +358,16 @@ export default async function handler(req, res) {
                     .replace(/\//g, '_')
                     .replace(/=+$/, '');
 
-                // Validate claims - NOW these checks are meaningful because Meta verified the signature
                 const nonceOk = payload.request_details?.nonce === expectedNonce;
                 const packageOk = payload.app_state?.package_id === "com.ContinuumXR.UG";
                 const fresh = Math.abs(Date.now() / 1000 - (payload.request_details?.timestamp || 0)) < 300;
                 const strictAppOk = rawApp === "StoreRecognized";
                 const strictDeviceOk = rawDevice === "Advanced";
+                const certOk = attestation.cert_check.valid;
 
-                attestation.valid = nonceOk && packageOk && fresh && strictAppOk && strictDeviceOk;
+                const certCheckApplies = !!VALID_CERT_HASH;
+                attestation.valid = nonceOk && packageOk && fresh && strictAppOk && strictDeviceOk && 
+                                   (certCheckApplies ? certOk : true);
 
                 if (!attestation.valid) {
                     const failReasons = [];
@@ -248,10 +376,15 @@ export default async function handler(req, res) {
                     if (!fresh) failReasons.push("token_stale");
                     if (!strictAppOk) failReasons.push(`app_${rawApp}`);
                     if (!strictDeviceOk) failReasons.push(`device_${rawDevice}`);
+                    if (certCheckApplies && !certOk) failReasons.push(`cert_${attestation.cert_check.reason}`);
                     attestation.reason = failReasons.join("|") || "unknown";
                     console.warn(`[ATTESTATION FAILED] User:${metaId} | Reasons:${attestation.reason}`);
                 } else {
                     attestation.reason = "ok";
+                }
+
+                if (!attestation.cert_check.valid && attestation.cert_check.reason === "cert_mismatch") {
+                    console.warn(`[CERT MISMATCH] User:${metaId} | ClientCert:${attestation.cert_check.clientHash} | Expected:${VALID_CERT_HASH}`);
                 }
             }
         }
@@ -276,16 +409,35 @@ export default async function handler(req, res) {
         const playfabData = await playfabResp.json();
 
         if (!playfabResp.ok) {
-            // Only apply Meta device ban if we have a verified unique_id and user is PlayFab banned
-            if (playfabData.errorCode === 1002 && attestation.unique_id) {
-                await banDeviceViaMeta(attestation.unique_id, oculusAccessToken);
+            if (playfabData.errorCode === 1002) {
+                // User is banned - extract ban info from PlayFab response
+                const banInfo = extractBanInfo(playfabData);
+                
+                console.warn(`[BANNED USER LOGIN] MetaId:${metaId} | Reason:${banInfo.reason} | Expiry:${banInfo.expiry} | Duration:${banInfo.durationMinutes} minutes`);
+
+                // Apply Meta device ban with matching duration
+                if (attestation.unique_id) {
+                    await banDeviceViaMeta(attestation.unique_id, oculusAccessToken, banInfo.durationMinutes);
+                }
+
+                return res.status(403).json({
+                    success: false,
+                    error: "AccountBanned",
+                    errorCode: 1002,
+                    errorMessage: "Account is banned.",
+                    banInfo: { 
+                        reason: banInfo.reason, 
+                        expiry: banInfo.expiry 
+                    }
+                });
             }
-            return res.status(playfabData.errorCode === 1002 ? 403 : 400).json({
+
+            // Non-ban error
+            return res.status(400).json({
                 success: false,
-                error: playfabData.errorCode === 1002 ? "AccountBanned" : "Authentication failed",
+                error: "Authentication failed",
                 errorCode: playfabData.errorCode || 0,
-                errorMessage: "Unable to authenticate. Please try again.",
-                banInfo: playfabData.errorCode === 1002 ? { reason: "Security violation", expiry: "Indefinite" } : undefined
+                errorMessage: playfabData.errorMessage || "Unable to authenticate. Please try again."
             });
         }
 
@@ -301,11 +453,9 @@ export default async function handler(req, res) {
                 });
             }
 
-            // Only enforce on claims failures, not verification_failed (handled above)
             if (!attestation.valid && attestation.reason !== "verification_failed") {
                 let allow = false;
 
-                // === DEVELOPER BYPASS: Only for Meta-verified NotEvaluated ===
                 if (attestation.app_integrity === "NotEvaluated") {
                     const isDev = await isDeveloper(playFabId, titleId, secretKey);
                     if (isDev) {
@@ -315,9 +465,9 @@ export default async function handler(req, res) {
                 }
 
                 if (!allow) {
-                    console.warn(`[ATTESTATION BAN] Banning PlayFabId:${playFabId} | MetaId:${metaId} | App:${attestation.app_integrity} | Device:${attestation.device_integrity}`);
+                    console.warn(`[ATTESTATION BAN] PlayFabId:${playFabId} | MetaId:${metaId} | App:${attestation.app_integrity} | Device:${attestation.device_integrity} | Cert:${attestation.cert_check?.reason || 'n/a'}`);
 
-                    // 1. PlayFab Account Ban
+                    // PlayFab permanent ban for attestation failures
                     try {
                         await fetch(`https://${titleId}.playfabapi.com/Server/BanUsers`, {
                             method: 'POST',
@@ -328,7 +478,7 @@ export default async function handler(req, res) {
                         });
                     } catch (e) { console.error("[PLAYFAB BAN FAILED]", e); }
 
-                    // 2. Meta Hardware Ban (survives factory reset)
+                    // Meta permanent hardware ban for attestation failures
                     if (attestation.unique_id) {
                         const result = await banDeviceViaMeta(attestation.unique_id, oculusAccessToken);
                         if (result.success) {
@@ -355,8 +505,7 @@ export default async function handler(req, res) {
             }
         }
 
-        // === Forensic Logging (only on integrity failures, not verification_failed) ===
-        // verification_failed is logged separately to avoid conflating infra issues with cheating
+        // === Forensic Logging ===
         if (attestationToken && !attestation.valid && attestation.reason !== "verification_failed") {
             const now = new Date().toISOString();
             const currentResp = await fetch(`https://${titleId}.playfabapi.com/Server/GetUserInternalData`, {
@@ -367,7 +516,8 @@ export default async function handler(req, res) {
                     Keys: [
                         "DeviceIntegrity_FirstFail", "DeviceIntegrity_LastFail", "DeviceIntegrity_FailCount",
                         "DeviceIntegrity_EverFailed", "DeviceIntegrity_WorstAppState", "DeviceIntegrity_WorstDeviceState",
-                        "DeviceIntegrity_FailReasons", "DeviceIntegrity_MetaUniqueId"
+                        "DeviceIntegrity_FailReasons", "DeviceIntegrity_MetaUniqueId",
+                        "DeviceIntegrity_CertHash", "DeviceIntegrity_CertMismatchCount", "DeviceIntegrity_FirstCertMismatch"
                     ]
                 })
             });
@@ -380,35 +530,17 @@ export default async function handler(req, res) {
             updates.DeviceIntegrity_FailCount = String((parseInt(current.DeviceIntegrity_FailCount?.Value) || 0) + 1);
             updates.DeviceIntegrity_EverFailed = "true";
 
-            // Severity order for worstState(): index 0 = worst, higher index = better
-            const appOrder    = KNOWN_APP_STATES;
+            const appOrder = KNOWN_APP_STATES;
             const deviceOrder = KNOWN_DEVICE_STATES;
 
-            const severityApp = appOrder.includes(attestation.app_integrity) 
-                ? attestation.app_integrity 
-                : "NotRecognized";
+            const severityApp = appOrder.includes(attestation.app_integrity) ? attestation.app_integrity : "NotRecognized";
+            const severityDevice = deviceOrder.includes(attestation.device_integrity) ? attestation.device_integrity : "NotTrusted";
 
-            const severityDevice = deviceOrder.includes(attestation.device_integrity) 
-                ? attestation.device_integrity 
-                : "NotTrusted";
+            const worstApp = worstState(current.DeviceIntegrity_WorstAppState?.Value, severityApp, appOrder);
+            const worstDevice = worstState(current.DeviceIntegrity_WorstDeviceState?.Value, severityDevice, deviceOrder);
 
-            const worstApp = worstState(
-                current.DeviceIntegrity_WorstAppState?.Value,
-                severityApp,
-                appOrder
-            );
-            const worstDevice = worstState(
-                current.DeviceIntegrity_WorstDeviceState?.Value,
-                severityDevice,
-                deviceOrder
-            );
-
-            if (worstApp) {
-                updates.DeviceIntegrity_WorstAppState = worstApp;
-            }
-            if (worstDevice) {
-                updates.DeviceIntegrity_WorstDeviceState = worstDevice;
-            }
+            if (worstApp) updates.DeviceIntegrity_WorstAppState = worstApp;
+            if (worstDevice) updates.DeviceIntegrity_WorstDeviceState = worstDevice;
 
             const existing = (current.DeviceIntegrity_FailReasons?.Value || "").split("|").filter(Boolean);
             const newReasons = attestation.reason.split("|").filter(r => !existing.includes(r));
@@ -416,8 +548,14 @@ export default async function handler(req, res) {
                 updates.DeviceIntegrity_FailReasons = [...existing, ...newReasons].join("|");
             }
 
-            if (attestation.unique_id) {
-                updates.DeviceIntegrity_MetaUniqueId = attestation.unique_id;
+            if (attestation.unique_id) updates.DeviceIntegrity_MetaUniqueId = attestation.unique_id;
+            if (attestation.cert_check?.clientHash) updates.DeviceIntegrity_CertHash = attestation.cert_check.clientHash;
+            
+            if (attestation.cert_check?.reason === "cert_mismatch") {
+                updates.DeviceIntegrity_CertMismatchCount = String((parseInt(current.DeviceIntegrity_CertMismatchCount?.Value) || 0) + 1);
+                if (!current.DeviceIntegrity_FirstCertMismatch?.Value) {
+                    updates.DeviceIntegrity_FirstCertMismatch = now;
+                }
             }
 
             if (Object.keys(updates).length > 0) {
@@ -429,7 +567,7 @@ export default async function handler(req, res) {
             }
         }
 
-        // Log verification failures separately (infra issues, not client misbehaviour)
+        // Log verification failures separately
         if (attestation.reason === "verification_failed") {
             try {
                 const currentResp = await fetch(`https://${titleId}.playfabapi.com/Server/GetUserInternalData`, {
@@ -509,36 +647,4 @@ async function isDeveloper(playFabId, titleId, secretKey) {
         console.error('[isDeveloper failed]', e);
     }
     return false;
-}
-
-async function banDeviceViaMeta(uniqueId, accessToken) {
-    try {
-        const url = `https://graph.oculus.com/platform_integrity/device_ban`;
-
-        const resp = await fetch(url, {
-            method: 'POST',
-            headers: {
-                'Authorization': `Bearer ${accessToken}`,
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-                unique_id: uniqueId,
-                is_banned: true,
-                remaining_time_in_minute: 52560000 // 100 years
-            })
-        });
-
-        const data = await resp.json();
-
-        if (data.message === "Success" && data.ban_id) {
-            console.log(`[META DEVICE BAN] Success | UniqueId:${uniqueId} | BanId:${data.ban_id}`);
-            return { success: true, banId: data.ban_id };
-        } else {
-            console.error(`[META DEVICE BAN FAILED]`, data);
-            return { success: false, error: data };
-        }
-    } catch (e) {
-        console.error(`[META DEVICE BAN ERROR]`, e);
-        return { success: false, error: e.message };
-    }
 }
