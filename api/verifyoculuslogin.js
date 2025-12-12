@@ -173,21 +173,22 @@ function extractBanInfo(playfabErrorResponse) {
 }
 
 async function getPlayFabIdFromCustomId(metaId, titleId, secretKey) {
-  const resp = await fetch(`https://${titleId}.playfabapi.com/Server/GetPlayFabIDsFromCustomIDs`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "X-SecretKey": secretKey },
-    body: JSON.stringify({ CustomIDs: [metaId] })
-  });
+  try {
+    const resp = await fetch(`https://${titleId}.playfabapi.com/Server/GetPlayFabIDsFromGenericIDs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-SecretKey": secretKey },
+      body: JSON.stringify({
+        GenericIDs: [{ ServiceName: "CustomId", UserId: metaId }]
+      })
+    });
 
-  let j = null;
-  try { j = await resp.json(); } catch {}
-
-  if (!resp.ok) {
-    console.error("[PF LOOKUP] GetPlayFabIDsFromCustomIDs failed:", resp.status, j?.error, j?.errorMessage);
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    return data.data?.Data?.[0]?.PlayFabId ?? null;
+  } catch (e) {
+    console.error("[PF LOOKUP] Exception:", e);
     return null;
   }
-
-  return j?.data?.Data?.[0]?.PlayFabId ?? null;
 }
 
 /**
@@ -230,9 +231,8 @@ async function banDeviceAndStore(uniqueId, accessToken, durationMinutes = 525600
 
         if (data.message === "Success" && data.ban_id) {
             const durationDisplay = durationMinutes >= 52560000 ? 'PERMANENT' : `${durationMinutes} minutes`;
-            console.log(`[META DEVICE BAN] Success | PlayFabId:${playFabId || 'N/A'} | MetaId:${metaId} | UniqueId:${uniqueId} | Duration:${durationDisplay} | BanId:${data.ban_id} | Reason:${banReason}`);
-            
-            // ALWAYS store ban details to PlayFab for reversal capability
+            console.log(`[META DEVICE BAN] Success | MasterPlayFabId:${playFabId || 'UNKNOWN'} | MetaId:${metaId} | UniqueId:${uniqueId} | Duration:${durationDisplay} | BanId:${data.ban_id}`);            
+
             if (playFabId && titleId && secretKey) {
                 try {
                     await fetch(`https://${titleId}.playfabapi.com/Server/UpdateUserInternalData`, {
@@ -241,28 +241,28 @@ async function banDeviceAndStore(uniqueId, accessToken, durationMinutes = 525600
                         body: JSON.stringify({
                             PlayFabId: playFabId,
                             Data: {
-                                // Primary ban tracking fields
                                 MetaBan_UniqueId: uniqueId,
                                 MetaBan_BanId: data.ban_id,
                                 MetaBan_IssuedAt: new Date().toISOString(),
                                 MetaBan_Reason: banReason,
                                 MetaBan_DurationMinutes: String(durationMinutes),
-                                MetaBan_MetaId: metaId,
-                                // Legacy fields for backward compatibility
-                                DeviceIntegrity_MetaUniqueId: uniqueId,
-                                MetaBanId: data.ban_id,
-                                MetaBanTime: new Date().toISOString()
+                                MetaBan_MetaId: metaId
                             },
                             Permission: "Private"
                         })
                     });
-                    console.log(`[META BAN STORED] PlayFabId:${playFabId} | BanId:${data.ban_id}`);
+
+                    console.log(`[META BAN STORED] MasterPlayFabId:${playFabId} | BanId:${data.ban_id} | MetaId:${metaId}`);
                 } catch (storeErr) {
-                    console.error('[META BAN STORE FAILED]', storeErr);
-                    // Don't fail the ban just because storage failed - ban is still active
+                    console.error(`[META BAN STORE FAILED] MasterPlayFabId:${playFabId || 'MISSING'} | Error:`, storeErr);
                 }
             } else {
-                console.warn(`[META BAN] Ban issued but cannot store - missing PlayFabId/titleId/secretKey | UniqueId:${uniqueId} | BanId:${data.ban_id}`);
+                const missing = [];
+                if (!playFabId) missing.push("MasterPlayFabId");
+                if (!titleId)   missing.push("titleId");
+                if (!secretKey) missing.push("secretKey");
+
+                console.warn(`[META BAN RECORD NOT STORED] Device banned but storage skipped — missing: ${missing.join(", ")} | MetaId:${metaId} | UniqueId:${uniqueId} | BanId:${data.ban_id}`);
             }
 
             return { success: true, banId: data.ban_id };
@@ -482,20 +482,20 @@ export default async function handler(req, res) {
             if (playfabData.errorCode === 1002) {
                 // User is banned - extract ban info from PlayFab response
                 const banInfo = extractBanInfo(playfabData);
-                
-                console.warn(`[BANNED USER LOGIN] MetaId:${metaId} | Reason:${banInfo.reason} | Expiry:${banInfo.expiry} | Duration:${banInfo.durationMinutes} minutes`);
+                console.warn(`[BANNED USER LOGIN] MetaId:${metaId} | Reason:${banInfo.reason} | Expiry:${banInfo.expiry}`);
 
-                // Apply Meta device ban with matching duration
-                const lookedUpPlayFabId = await getPlayFabIdFromCustomId(metaId, titleId, secretKey);
+                const masterPlayFabId = await getPlayFabIdFromCustomId(metaId, titleId, secretKey);
 
-                if (attestation.unique_id) {
+                if (attestation.unique_id && masterPlayFabId) {
                     await banDeviceAndStore(attestation.unique_id, oculusAccessToken, banInfo.durationMinutes, {
-                    playFabId: lookedUpPlayFabId || undefined,
-                    titleId,
-                    secretKey,
-                    banReason: `PlayFab ban: ${banInfo.reason}`,
-                    metaId
+                        playFabId: masterPlayFabId,
+                        titleId,
+                        secretKey,
+                        banReason: `PlayFab ban: ${banInfo.reason}`,
+                        metaId
                     });
+                } else if (!masterPlayFabId) {
+                    console.error(`[CRITICAL] Failed to resolve MasterPlayFabId for banned MetaId:${metaId} — Meta ban NOT stored!`);
                 }
 
                 return res.status(403).json({
@@ -519,7 +519,7 @@ export default async function handler(req, res) {
             });
         }
 
-        const playFabId = playfabData.data.PlayFabId;
+        const masterPlayFabId = playfabData.data.PlayFabId;
 
         // === FINAL ENFORCEMENT ===
         if (ENFORCE_ATTESTATION) {
@@ -535,7 +535,7 @@ export default async function handler(req, res) {
                 let allow = false;
 
                 if (attestation.app_integrity === "NotEvaluated") {
-                    const isDev = await isDeveloper(playFabId, titleId, secretKey);
+                    const isDev = await isDeveloper(masterPlayFabId, titleId, secretKey);
                     if (isDev) {
                         console.log(`[DEV BYPASS] Allowing NotEvaluated for developer: ${metaId}`);
                         allow = true;
@@ -543,7 +543,7 @@ export default async function handler(req, res) {
                 }
 
                 if (!allow) {
-                    console.warn(`[ATTESTATION BAN] PlayFabId:${playFabId} | MetaId:${metaId} | App:${attestation.app_integrity} | Device:${attestation.device_integrity} | Cert:${attestation.cert_check?.reason || 'n/a'}`);
+                    console.warn(`[ATTESTATION BAN] PlayFabId:${masterPlayFabId} | MetaId:${metaId} | App:${attestation.app_integrity} | Device:${attestation.device_integrity} | Cert:${attestation.cert_check?.reason || 'n/a'}`);
 
                     // PlayFab permanent ban for attestation failures
                     try {
@@ -551,7 +551,7 @@ export default async function handler(req, res) {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json', 'X-SecretKey': secretKey },
                             body: JSON.stringify({
-                                Bans: [{ PlayFabId: playFabId, Reason: `Attestation: ${attestation.reason}` }]
+                                Bans: [{ PlayFabId: masterPlayFabId, Reason: `Attestation: ${attestation.reason}` }]
                             })
                         });
                     } catch (e) { console.error("[PLAYFAB BAN FAILED]", e); }
@@ -559,7 +559,7 @@ export default async function handler(req, res) {
                     // Meta permanent hardware ban for attestation failures (with storage)
                     if (attestation.unique_id) {
                         await banDeviceAndStore(attestation.unique_id, oculusAccessToken, 52560000, {
-                            playFabId,
+                            masterPlayFabId,
                             titleId,
                             secretKey,
                             banReason: `Attestation: ${attestation.reason}`,
@@ -585,7 +585,7 @@ export default async function handler(req, res) {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', 'X-SecretKey': secretKey },
                 body: JSON.stringify({
-                    PlayFabId: playFabId,
+                    PlayFabId: masterPlayFabId,
                     Keys: [
                         "DeviceIntegrity_FirstFail", "DeviceIntegrity_LastFail", "DeviceIntegrity_FailCount",
                         "DeviceIntegrity_EverFailed", "DeviceIntegrity_WorstAppState", "DeviceIntegrity_WorstDeviceState",
@@ -635,7 +635,7 @@ export default async function handler(req, res) {
                 await fetch(`https://${titleId}.playfabapi.com/Server/UpdateUserInternalData`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json', 'X-SecretKey': secretKey },
-                    body: JSON.stringify({ PlayFabId: playFabId, Data: updates, Permission: "Private" })
+                    body: JSON.stringify({ PlayFabId: masterPlayFabId, Data: updates, Permission: "Private" })
                 });
             }
         }
@@ -647,7 +647,7 @@ export default async function handler(req, res) {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json', 'X-SecretKey': secretKey },
                     body: JSON.stringify({
-                        PlayFabId: playFabId,
+                        PlayFabId: masterPlayFabId,
                         Keys: ["DeviceIntegrity_LastVerifyError", "DeviceIntegrity_VerifyErrorCount"]
                     })
                 });
@@ -670,13 +670,20 @@ export default async function handler(req, res) {
             }
         }
 
-        // === Success ===
-        const tokenResp = await fetch(`https://${titleId}.playfabapi.com/Admin/GetTitleInternalData`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'X-SecretKey': secretKey },
-            body: JSON.stringify({ Keys: ['ValidationToken'] })
-        });
-        const validationToken = tokenResp.ok ? (await tokenResp.json()).data?.Data?.ValidationToken : null;
+        if (playfabData.data.NewlyCreated) {
+            try {
+                await fetch(`https://${titleId}.playfabapi.com/Server/AddGenericID`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json", "X-SecretKey": secretKey },
+                    body: JSON.stringify({
+                        PlayFabId: masterPlayFabId,
+                        GenericId: { ServiceName: "CustomId", UserId: metaId }
+                    })
+                });
+            } catch (e) {
+                console.error("[GENERIC ID ADD FAILED]", e);
+            }
+        }
 
         return res.status(200).json({
             success: true,
@@ -686,8 +693,8 @@ export default async function handler(req, res) {
             infoPayload: JSON.stringify(playfabData.data.InfoResultPayload),
             entityToken: playfabData.data.EntityToken.EntityToken,
             entityId: playfabData.data.EntityToken.Entity.Id,
-            entityType: playfabData.data.EntityToken.Entity.Type,
-            token: validationToken
+            entityType: playfabData.data.EntityToken.Entity.Type//,
+            //token: validationToken
         });
 
     } catch (err) {
