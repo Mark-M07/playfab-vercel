@@ -172,10 +172,46 @@ function extractBanInfo(playfabErrorResponse) {
     }
 }
 
+async function getPlayFabIdFromCustomId(metaId, titleId, secretKey) {
+  const resp = await fetch(`https://${titleId}.playfabapi.com/Server/GetPlayFabIDsFromCustomIDs`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-SecretKey": secretKey },
+    body: JSON.stringify({ CustomIDs: [metaId] })
+  });
+
+  let j = null;
+  try { j = await resp.json(); } catch {}
+
+  if (!resp.ok) {
+    console.error("[PF LOOKUP] GetPlayFabIDsFromCustomIDs failed:", resp.status, j?.error, j?.errorMessage);
+    return null;
+  }
+
+  return j?.data?.Data?.[0]?.PlayFabId ?? null;
+}
+
 /**
- * Bans a device via Meta's API with specified duration.
+ * Bans a device via Meta's API and stores ban details to PlayFab for reversal capability.
+ * ALWAYS stores the ban ID and unique ID when PlayFabId is provided.
+ * 
+ * @param {string} uniqueId - Device unique ID from attestation
+ * @param {string} accessToken - Meta API access token  
+ * @param {number} durationMinutes - Ban duration in minutes (default: 100 years)
+ * @param {object} options - Additional options
+ * @param {string} options.playFabId - PlayFab ID to store ban details (recommended)
+ * @param {string} options.titleId - PlayFab title ID
+ * @param {string} options.secretKey - PlayFab secret key
+ * @param {string} options.banReason - Reason for the ban (for logging/storage)
+ * @param {string} options.metaId - Meta user ID (for logging/storage)
  */
-async function banDeviceViaMeta(uniqueId, accessToken, durationMinutes = 52560000) {
+async function banDeviceAndStore(uniqueId, accessToken, durationMinutes = 52560000, options = {}) {
+    const { playFabId, titleId, secretKey, banReason = "Security violation", metaId = "unknown" } = options;
+
+    if (!uniqueId) {
+        console.warn('[META DEVICE BAN] No unique_id available - cannot ban device');
+        return { success: false, error: 'No unique_id' };
+    }
+
     try {
         const resp = await fetch('https://graph.oculus.com/platform_integrity/device_ban', {
             method: 'POST',
@@ -194,7 +230,41 @@ async function banDeviceViaMeta(uniqueId, accessToken, durationMinutes = 5256000
 
         if (data.message === "Success" && data.ban_id) {
             const durationDisplay = durationMinutes >= 52560000 ? 'PERMANENT' : `${durationMinutes} minutes`;
-            console.log(`[META DEVICE BAN] Success | UniqueId:${uniqueId} | Duration:${durationDisplay} | BanId:${data.ban_id}`);
+            console.log(`[META DEVICE BAN] Success | PlayFabId:${playFabId || 'N/A'} | MetaId:${metaId} | UniqueId:${uniqueId} | Duration:${durationDisplay} | BanId:${data.ban_id} | Reason:${banReason}`);
+            
+            // ALWAYS store ban details to PlayFab for reversal capability
+            if (playFabId && titleId && secretKey) {
+                try {
+                    await fetch(`https://${titleId}.playfabapi.com/Server/UpdateUserInternalData`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'X-SecretKey': secretKey },
+                        body: JSON.stringify({
+                            PlayFabId: playFabId,
+                            Data: {
+                                // Primary ban tracking fields
+                                MetaBan_UniqueId: uniqueId,
+                                MetaBan_BanId: data.ban_id,
+                                MetaBan_IssuedAt: new Date().toISOString(),
+                                MetaBan_Reason: banReason,
+                                MetaBan_DurationMinutes: String(durationMinutes),
+                                MetaBan_MetaId: metaId,
+                                // Legacy fields for backward compatibility
+                                DeviceIntegrity_MetaUniqueId: uniqueId,
+                                MetaBanId: data.ban_id,
+                                MetaBanTime: new Date().toISOString()
+                            },
+                            Permission: "Private"
+                        })
+                    });
+                    console.log(`[META BAN STORED] PlayFabId:${playFabId} | BanId:${data.ban_id}`);
+                } catch (storeErr) {
+                    console.error('[META BAN STORE FAILED]', storeErr);
+                    // Don't fail the ban just because storage failed - ban is still active
+                }
+            } else {
+                console.warn(`[META BAN] Ban issued but cannot store - missing PlayFabId/titleId/secretKey | UniqueId:${uniqueId} | BanId:${data.ban_id}`);
+            }
+
             return { success: true, banId: data.ban_id };
         } else {
             console.error(`[META DEVICE BAN FAILED]`, data);
@@ -416,8 +486,16 @@ export default async function handler(req, res) {
                 console.warn(`[BANNED USER LOGIN] MetaId:${metaId} | Reason:${banInfo.reason} | Expiry:${banInfo.expiry} | Duration:${banInfo.durationMinutes} minutes`);
 
                 // Apply Meta device ban with matching duration
+                const lookedUpPlayFabId = await getPlayFabIdFromCustomId(metaId, titleId, secretKey);
+
                 if (attestation.unique_id) {
-                    await banDeviceViaMeta(attestation.unique_id, oculusAccessToken, banInfo.durationMinutes);
+                    await banDeviceAndStore(attestation.unique_id, oculusAccessToken, banInfo.durationMinutes, {
+                    playFabId: lookedUpPlayFabId || undefined,
+                    titleId,
+                    secretKey,
+                    banReason: `PlayFab ban: ${banInfo.reason}`,
+                    metaId
+                    });
                 }
 
                 return res.status(403).json({
@@ -478,20 +556,15 @@ export default async function handler(req, res) {
                         });
                     } catch (e) { console.error("[PLAYFAB BAN FAILED]", e); }
 
-                    // Meta permanent hardware ban for attestation failures
+                    // Meta permanent hardware ban for attestation failures (with storage)
                     if (attestation.unique_id) {
-                        const result = await banDeviceViaMeta(attestation.unique_id, oculusAccessToken);
-                        if (result.success) {
-                            await fetch(`https://${titleId}.playfabapi.com/Server/UpdateUserInternalData`, {
-                                method: 'POST',
-                                headers: { 'Content-Type': 'application/json', 'X-SecretKey': secretKey },
-                                body: JSON.stringify({
-                                    PlayFabId: playFabId,
-                                    Data: { MetaBanId: result.banId, MetaBanTime: new Date().toISOString() },
-                                    Permission: "Private"
-                                })
-                            });
-                        }
+                        await banDeviceAndStore(attestation.unique_id, oculusAccessToken, 52560000, {
+                            playFabId,
+                            titleId,
+                            secretKey,
+                            banReason: `Attestation: ${attestation.reason}`,
+                            metaId
+                        });
                     }
 
                     return res.status(403).json({
