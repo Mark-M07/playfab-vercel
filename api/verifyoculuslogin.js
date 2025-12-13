@@ -150,15 +150,15 @@ function applyMetaBanToBlob(blob, { uniqueId, banId, issuedAt, reason, durationM
 
 // === REASON FLAGS (bitmask) ===
 const FLAGS = {
-  NONCE_MISMATCH:      1 << 0,
-  PACKAGE_MISMATCH:    1 << 1,
-  TOKEN_STALE:         1 << 2,
-  APP_NOT_RECOGNIZED:  1 << 3,
-  APP_NOT_EVALUATED:   1 << 4,
-  DEVICE_NOT_TRUSTED:  1 << 5,
-  DEVICE_BASIC:        1 << 6,
-  CERT_MISMATCH:       1 << 7,
-  CERT_MISSING:        1 << 8,
+  NONCE_MISMATCH:      1 << 0,  // 1
+  PACKAGE_MISMATCH:    1 << 1,  // 2
+  TOKEN_STALE:         1 << 2,  // 4
+  APP_NOT_RECOGNIZED:  1 << 3,  // 8
+  APP_NOT_EVALUATED:   1 << 4,  // 16
+  DEVICE_NOT_TRUSTED:  1 << 5,  // 32
+  DEVICE_BASIC:        1 << 6,  // 64
+  CERT_MISMATCH:       1 << 7,  // 128
+  CERT_MISSING:        1 << 8,  // 256
 };
 
 // Verify attestation token with Meta's server-to-server API
@@ -723,7 +723,7 @@ export default async function handler(req, res) {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', 'X-SecretKey': secretKey },
                 body: JSON.stringify({
-                  Bans: [{ PlayFabId: masterPlayFabId, Reason: `Attestation: ${attestation.reason}` }]
+                  Bans: [{ PlayFabId: masterPlayFabId, Reason: "Security violation" }]
                 })
               });
             } catch (e) {
@@ -838,6 +838,7 @@ export default async function handler(req, res) {
         }
         di.rm = rm;
 
+        // Rest of your existing code (unique_id, cert, etc.) is safe
         if (attestation.unique_id) di.uid = attestation.unique_id;
         if (attestation.cert_check?.clientHash) di.ch = attestation.cert_check.clientHash;
         if (attestation.cert_check?.reason === "cert_mismatch") {
