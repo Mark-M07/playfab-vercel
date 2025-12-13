@@ -12,7 +12,7 @@ const KNOWN_DEVICE_STATES = ["NotTrusted", "Basic", "Advanced"];
 //   - block: Reject this login attempt but don't ban
 //   - ban:   Reject login AND issue permanent PlayFab + Meta device ban
 const ENFORCEMENT_CONFIG = {
-  enabled: false, // Master switch - set to true to enable enforcement
+  enabled: true, // Master switch - set to true to enable enforcement
   
   // Device integrity failures
   device_NotTrusted: "ban",     // Worst - definitely compromised
