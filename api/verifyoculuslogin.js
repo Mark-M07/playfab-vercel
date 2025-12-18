@@ -675,12 +675,18 @@ export default async function handler(req, res) {
       if (!attestationToken) {
         const noTokenAction = getEnforcementAction("no_token");
         if (noTokenAction !== "allow") {
-          console.warn(`[ATTESTATION BLOCKED] No token | MetaId:${metaId} | Action:${noTokenAction}`);
-          return res.status(403).json({
-            success: false,
-            error: "UpdateRequired",
-            errorMessage: "A new game update is required to play."
-          });
+          // Check if developer before blocking
+          const isDev = await isDeveloper(masterPlayFabId, titleId, secretKey);
+          if (isDev) {
+            console.log(`[DEV BYPASS] Allowing missing attestation token for developer: ${metaId}`);
+          } else {
+            console.warn(`[ATTESTATION BLOCKED] No token | MetaId:${metaId} | Action:${noTokenAction}`);
+            return res.status(403).json({
+              success: false,
+              error: "UpdateRequired",
+              errorMessage: "Unable to verify device. Please try again."
+            });
+          }
         }
       }
 
@@ -693,7 +699,7 @@ export default async function handler(req, res) {
             success: false,
             error: "VerificationFailed",
             errorCode: 1003,
-            errorMessage: "Unable to verify device. Please try again later."
+            errorMessage: "Unable to verify device. Please try again."
           });
         }
       }
@@ -779,7 +785,7 @@ export default async function handler(req, res) {
               success: false,
               error: "AuthenticationBlocked",
               errorCode: 1004,
-              errorMessage: "Unable to authenticate. Please try again later."
+              errorMessage: "Unable to authenticate. Please try again."
             });
           }
         }
