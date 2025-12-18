@@ -697,7 +697,7 @@ export default async function handler(req, res) {
       }
 
       // Handle verification failures (Meta API couldn't verify)
-      if (!(await checkIsDev()) && attestation.reason === "verification_failed") {
+      if (attestation.reason === "verification_failed" && !(await checkIsDev())) {
         const verifyAction = getEnforcementAction("verification_failed");
         if (verifyAction !== "allow") {
           console.warn(`[ATTESTATION BLOCKED] Verification failed | MetaId:${metaId} | Action:${verifyAction}`);
@@ -711,7 +711,7 @@ export default async function handler(req, res) {
       }
 
       // Handle attestation failures with tiered enforcement
-      if (!(await checkIsDev()) && !attestation.valid && attestation.reason !== "verification_failed") {
+      if (!attestation.valid && attestation.reason !== "verification_failed" && !(await checkIsDev())) {
         const action = getEnforcementAction(attestation.reason);
 
         if (action !== "allow") {
