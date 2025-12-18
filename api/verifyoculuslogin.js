@@ -37,7 +37,7 @@ const ENFORCEMENT_CONFIG = {
   verification_failed: "block", // Block but don't ban (could be API issue)
   
   // No attestation token provided (old client)
-  no_token: "allow",            // Require updated client
+  no_token: "block",            // Require updated client
 };
 
 // Helper to determine action for a given failure
