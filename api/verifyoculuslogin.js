@@ -671,13 +671,19 @@ export default async function handler(req, res) {
 
     // === FINAL ENFORCEMENT ===
     if (ENFORCEMENT_CONFIG.enabled) {
+      let _isDev;
+      const checkIsDev = async () => {
+        if (_isDev === undefined) {
+          _isDev = await isDeveloper(masterPlayFabId, titleId, secretKey);
+        }
+        return _isDev;
+      };
+
       // Handle missing attestation token
       if (!attestationToken) {
         const noTokenAction = getEnforcementAction("no_token");
         if (noTokenAction !== "allow") {
-          // Check if developer before blocking
-          const isDev = await isDeveloper(masterPlayFabId, titleId, secretKey);
-          if (isDev) {
+          if (await checkIsDev()) {
             console.log(`[DEV BYPASS] Allowing missing attestation token for developer: ${metaId}`);
           } else {
             console.warn(`[ATTESTATION BLOCKED] No token | MetaId:${metaId} | Action:${noTokenAction}`);
@@ -691,7 +697,7 @@ export default async function handler(req, res) {
       }
 
       // Handle verification failures (Meta API couldn't verify)
-      if (attestation.reason === "verification_failed") {
+      if (!(await checkIsDev()) && attestation.reason === "verification_failed") {
         const verifyAction = getEnforcementAction("verification_failed");
         if (verifyAction !== "allow") {
           console.warn(`[ATTESTATION BLOCKED] Verification failed | MetaId:${metaId} | Action:${verifyAction}`);
@@ -705,20 +711,10 @@ export default async function handler(req, res) {
       }
 
       // Handle attestation failures with tiered enforcement
-      if (!attestation.valid && attestation.reason !== "verification_failed") {
+      if (!(await checkIsDev()) && !attestation.valid && attestation.reason !== "verification_failed") {
         const action = getEnforcementAction(attestation.reason);
-        
-        // Developer bypass for NotEvaluated
-        let allow = action === "allow";
-        if (!allow && attestation.app_integrity === "NotEvaluated") {
-          const isDev = await isDeveloper(masterPlayFabId, titleId, secretKey);
-          if (isDev) {
-            console.log(`[DEV BYPASS] Allowing NotEvaluated for developer: ${metaId}`);
-            allow = true;
-          }
-        }
 
-        if (!allow) {
+        if (action !== "allow") {
           console.warn(`[ATTESTATION ${action.toUpperCase()}] PlayFabId:${masterPlayFabId} | MetaId:${metaId} | App:${attestation.app_integrity} | Device:${attestation.device_integrity} | Reasons:${attestation.reason} | Action:${action}`);
 
           // Only ban if action is "ban" (not "block")
@@ -881,7 +877,7 @@ export default async function handler(req, res) {
     }
 
     // Log verification failures in Security blob (no extra keys)
-    if (attestation.reason === "verification_failed") {
+    if (!(await checkIsDev()) && attestation.reason === "verification_failed") {
       const now = new Date().toISOString();
       const blob = await ensureBlob();
       if (blob) {
