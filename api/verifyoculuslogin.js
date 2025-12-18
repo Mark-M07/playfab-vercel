@@ -877,7 +877,7 @@ export default async function handler(req, res) {
     }
 
     // Log verification failures in Security blob (no extra keys)
-    if (!(await checkIsDev()) && attestation.reason === "verification_failed") {
+    if (attestation.reason === "verification_failed") {
       const now = new Date().toISOString();
       const blob = await ensureBlob();
       if (blob) {
