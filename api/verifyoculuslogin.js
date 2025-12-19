@@ -3,8 +3,20 @@ import fetch from 'node-fetch';
 import querystring from 'node:querystring';
 import crypto from 'crypto';
 
+// === CONFIGURATION ===
 const KNOWN_APP_STATES = ["NotRecognized", "NotEvaluated", "StoreRecognized"];
 const KNOWN_DEVICE_STATES = ["NotTrusted", "Basic", "Advanced"];
+
+// Expected package ID (optional environment variable override)
+const EXPECTED_PACKAGE_ID = process.env.EXPECTED_PACKAGE_ID || "com.ContinuumXR.UG";
+
+// APK Certificate Validation Config
+// SHA256 hash of release signing certificate (lowercase, no colons)
+// Leave empty to monitor without validation (will log all cert hashes)
+const VALID_CERT_HASH = (process.env.VALID_CERT_HASH || "").trim().toLowerCase();
+
+// Token freshness threshold in seconds
+const TOKEN_FRESHNESS_THRESHOLD = 300;
 
 // === ENFORCEMENT CONFIGURATION ===
 // Action types: "allow" | "block" | "ban"
@@ -12,7 +24,7 @@ const KNOWN_DEVICE_STATES = ["NotTrusted", "Basic", "Advanced"];
 //   - block: Reject this login attempt but don't ban
 //   - ban:   Reject login AND issue permanent PlayFab + Meta device ban
 const ENFORCEMENT_CONFIG = {
-  enabled: false, // Master switch - set to true to enable enforcement
+  enabled: true, // Master switch - set to true to enable enforcement
   
   // Device integrity failures
   device_NotTrusted: "ban",     // Worst - definitely compromised
@@ -23,7 +35,7 @@ const ENFORCEMENT_CONFIG = {
   
   // App integrity failures
   app_NotRecognized: "ban",     // Sideloaded/pirated APK
-  app_NotEvaluated: "ban",      // Ban non-devs (isDeveloper check handles legitimate devs)
+  app_NotEvaluated: "ban",      // Not in any Meta release channel
   
   // Certificate mismatch
   cert_mismatch: "ban",         // Modified APK
@@ -36,11 +48,28 @@ const ENFORCEMENT_CONFIG = {
   // Meta API couldn't verify token
   verification_failed: "block", // Block but don't ban (could be API issue)
   
-  // No attestation token provided (old client)
-  no_token: "block",            // Require updated client
+  // No attestation token provided
+  no_token: "block",            // Modified client
 };
 
-// Helper to determine action for a given failure
+// === REASON FLAGS (bitmask) ===
+const FLAGS = {
+  NONCE_MISMATCH:      1 << 0,  // 1
+  PACKAGE_MISMATCH:    1 << 1,  // 2
+  TOKEN_STALE:         1 << 2,  // 4
+  APP_NOT_RECOGNIZED:  1 << 3,  // 8
+  APP_NOT_EVALUATED:   1 << 4,  // 16
+  DEVICE_NOT_TRUSTED:  1 << 5,  // 32
+  DEVICE_BASIC:        1 << 6,  // 64
+  CERT_MISMATCH:       1 << 7,  // 128
+  CERT_MISSING:        1 << 8,  // 256
+};
+
+// === HELPERS ===
+
+/**
+ * Helper to determine action for a given failure
+ */
 function getEnforcementAction(failReasons) {
   if (!ENFORCEMENT_CONFIG.enabled) return "allow";
   
@@ -58,6 +87,11 @@ function getEnforcementAction(failReasons) {
     
     const reasonAction = ENFORCEMENT_CONFIG[configKey];
     
+    // Warn on unknown config keys (typos, new Meta states, etc.)
+    if (reasonAction === undefined) {
+      console.warn(`[ENFORCEMENT] Unknown reason key: ${configKey} — defaulting to allow`);
+    }
+    
     // Escalate: ban > block > allow
     if (reasonAction === "ban") return "ban"; // Immediate escalation
     if (reasonAction === "block" && action !== "ban") action = "block";
@@ -66,12 +100,16 @@ function getEnforcementAction(failReasons) {
   return action;
 }
 
-// APK Certificate Validation Config
-// SHA256 hash of your release signing certificate (lowercase, no colons)
-// Get this from your first successful attestation log or from your keystore
-// Leave empty to monitor without validation (will log all cert hashes)
-const VALID_CERT_HASH = (process.env.VALID_CERT_HASH || "").trim().toLowerCase();
+/**
+ * Safe JSON parser with fallback
+ */
+function safeParseJson(str, fallback) {
+  try { return str ? JSON.parse(str) : fallback; } catch { return fallback; }
+}
 
+/**
+ * Read JSON from response with error handling
+ */
 async function readJson(resp, label, { maxLog = 400 } = {}) {
   const text = await resp.text().catch(() => "");
   if (!text) {
@@ -86,11 +124,123 @@ async function readJson(resp, label, { maxLog = 400 } = {}) {
   }
 }
 
-// === SECURITY BLOB HELPERS ===
-// Single key in PlayerInternalData: "Security"
-function safeParseJson(str, fallback) {
-  try { return str ? JSON.parse(str) : fallback; } catch { return fallback; }
+/**
+ * Validates the APK signing certificate hash against the expected hash.
+ */
+function validateCertificate(certHashes) {
+  const result = { valid: true, reason: "ok", clientHash: null };
+
+  if (!certHashes || !Array.isArray(certHashes) || certHashes.length === 0) {
+    result.valid = false;
+    result.reason = "no_cert_in_payload";
+    return result;
+  }
+
+  result.clientHash = String(certHashes[0] || "").toLowerCase();
+
+  if (!VALID_CERT_HASH) {
+    result.reason = "no_expected_hash_configured";
+    console.log(`[CERT CHECK] No expected hash configured. Client cert: ${result.clientHash}`);
+    return result;
+  }
+
+  if (result.clientHash !== VALID_CERT_HASH) {
+    result.valid = false;
+    result.reason = "cert_mismatch";
+  }
+
+  return result;
 }
+
+/**
+ * Analyzes attestation payload and returns consolidated check results.
+ * Single source of truth for all attestation checks - used by both enforcement and forensics.
+ */
+function analyzeAttestationPayload(payload, nonce, certCheck) {
+  const certCheckApplies = !!VALID_CERT_HASH;
+  
+  // Compute expected nonce hash
+  const expectedNonce = crypto.createHash('sha256')
+    .update(nonce)
+    .digest('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+
+  // All checks in one place
+  const checks = {
+    nonceOk: payload?.request_details?.nonce === expectedNonce,
+    packageOk: payload?.app_state?.package_id === EXPECTED_PACKAGE_ID,
+    fresh: payload?.request_details?.timestamp 
+      ? Math.abs(Date.now() / 1000 - payload.request_details.timestamp) < TOKEN_FRESHNESS_THRESHOLD 
+      : false,
+    strictAppOk: payload?.app_state?.app_integrity_state === "StoreRecognized",
+    strictDeviceOk: payload?.device_state?.device_integrity_state === "Advanced",
+    certOk: certCheck?.valid ?? true,
+  };
+
+  // Determine overall validity
+  const isValid = checks.nonceOk &&
+    checks.packageOk &&
+    checks.fresh &&
+    checks.strictAppOk &&
+    checks.strictDeviceOk &&
+    (certCheckApplies ? checks.certOk : true);
+
+  // Build fail reasons list
+  // Normalise unknown states to prevent log pollution if Meta introduces new states
+  const rawAppState = payload?.app_state?.app_integrity_state || "unknown";
+  const rawDeviceState = payload?.device_state?.device_integrity_state || "unknown";
+  const normalisedAppState = KNOWN_APP_STATES.includes(rawAppState) ? rawAppState : "Unknown";
+  const normalisedDeviceState = KNOWN_DEVICE_STATES.includes(rawDeviceState) ? rawDeviceState : "Unknown";
+
+  const failReasons = [];
+  if (!checks.nonceOk) failReasons.push("nonce_mismatch");
+  if (!checks.packageOk) failReasons.push("package_mismatch");
+  if (!checks.fresh) failReasons.push("token_stale");
+  if (!checks.strictAppOk) failReasons.push(`app_${normalisedAppState}`);
+  if (!checks.strictDeviceOk) failReasons.push(`device_${normalisedDeviceState}`);
+  if (certCheckApplies && !checks.certOk) {
+    failReasons.push(`cert_${certCheck?.reason || "bad_cert"}`);
+  }
+
+  // Compute reason bitmask for forensics (using normalised states)
+  let reasonMask = 0;
+  if (!checks.nonceOk) reasonMask |= FLAGS.NONCE_MISMATCH;
+  if (!checks.packageOk) reasonMask |= FLAGS.PACKAGE_MISMATCH;
+  if (!checks.fresh) reasonMask |= FLAGS.TOKEN_STALE;
+  if (!checks.strictAppOk) {
+    reasonMask |= normalisedAppState === "NotEvaluated" ? FLAGS.APP_NOT_EVALUATED : FLAGS.APP_NOT_RECOGNIZED;
+  }
+  if (!checks.strictDeviceOk) {
+    reasonMask |= normalisedDeviceState === "Basic" ? FLAGS.DEVICE_BASIC : FLAGS.DEVICE_NOT_TRUSTED;
+  }
+  if (certCheckApplies && !checks.certOk) {
+    reasonMask |= certCheck?.reason === "cert_mismatch" ? FLAGS.CERT_MISMATCH : FLAGS.CERT_MISSING;
+  }
+
+  return {
+    checks,
+    isValid,
+    failReasons,
+    reasonString: failReasons.join("|") || "ok",
+    reasonMask,
+    certCheckApplies,
+  };
+}
+
+/**
+ * Determine worst state between current and candidate
+ */
+function worstState(current, candidate, order) {
+  if (!candidate) return null;
+  const scores = Object.fromEntries(order.map((s, i) => [s, i]));
+  const curScore = current ? (scores[current] ?? 999) : 999;
+  const candScore = scores[candidate] ?? 999;
+  return candScore < curScore ? candidate : null;
+}
+
+// === SECURITY BLOB HELPERS ===
 
 async function loadSecurityBlob(titleId, secretKey, playFabId) {
   const resp = await fetch(`https://${titleId}.playfabapi.com/Server/GetUserInternalData`, {
@@ -148,20 +298,11 @@ function applyMetaBanToBlob(blob, { uniqueId, banId, issuedAt, reason, durationM
   });
 }
 
-// === REASON FLAGS (bitmask) ===
-const FLAGS = {
-  NONCE_MISMATCH:      1 << 0,  // 1
-  PACKAGE_MISMATCH:    1 << 1,  // 2
-  TOKEN_STALE:         1 << 2,  // 4
-  APP_NOT_RECOGNIZED:  1 << 3,  // 8
-  APP_NOT_EVALUATED:   1 << 4,  // 16
-  DEVICE_NOT_TRUSTED:  1 << 5,  // 32
-  DEVICE_BASIC:        1 << 6,  // 64
-  CERT_MISMATCH:       1 << 7,  // 128
-  CERT_MISSING:        1 << 8,  // 256
-};
+// === META API HELPERS ===
 
-// Verify attestation token with Meta's server-to-server API
+/**
+ * Verify attestation token with Meta's server-to-server API
+ */
 async function verifyAttestationWithMeta(token, accessToken) {
   try {
     if (!token) return null;
@@ -217,105 +358,6 @@ async function verifyAttestationWithMeta(token, accessToken) {
     }
   } catch (e) {
     console.error("[ATTESTATION VERIFY ERROR]", e.message);
-    return null;
-  }
-}
-
-/**
- * Validates the APK signing certificate hash against the expected hash.
- */
-function validateCertificate(certHashes) {
-  const result = { valid: true, reason: "ok", clientHash: null };
-
-  if (!certHashes || !Array.isArray(certHashes) || certHashes.length === 0) {
-    result.valid = false;
-    result.reason = "no_cert_in_payload";
-    return result;
-  }
-
-  result.clientHash = String(certHashes[0] || "").toLowerCase();
-
-  if (!VALID_CERT_HASH) {
-    result.reason = "no_expected_hash_configured";
-    console.log(`[CERT CHECK] No expected hash configured. Client cert: ${result.clientHash}`);
-    return result;
-  }
-
-  if (result.clientHash !== VALID_CERT_HASH) {
-    result.valid = false;
-    result.reason = "cert_mismatch";
-  }
-
-  return result;
-}
-
-/**
- * Extracts ban info from PlayFab error response.
- * PlayFab format: { errorDetails: { "BanReason": ["ExpiryDateOrIndefinite"] } }
- * Returns { reason, expiry, durationMinutes }
- */
-function extractBanInfo(playfabErrorResponse) {
-  const result = {
-    reason: "Account suspended",
-    expiry: "Indefinite",
-    durationMinutes: 52560000 // 100 years (permanent)
-  };
-
-  try {
-    const errorDetails = playfabErrorResponse?.errorDetails;
-    if (errorDetails && typeof errorDetails === 'object') {
-      const reasons = Object.keys(errorDetails);
-      if (reasons.length > 0) {
-        result.reason = reasons[0];
-        const expiryArray = errorDetails[reasons[0]];
-        if (Array.isArray(expiryArray) && expiryArray.length > 0) {
-          result.expiry = expiryArray[0];
-        }
-      }
-    }
-
-    if (result.expiry && result.expiry !== "Indefinite") {
-      try {
-        const expiryDate = new Date(result.expiry);
-        const now = new Date();
-        const diffMs = expiryDate.getTime() - now.getTime();
-
-        if (diffMs > 0) {
-          result.durationMinutes = Math.min(
-            Math.ceil(diffMs / (1000 * 60)),
-            52560000
-          );
-        } else {
-          result.durationMinutes = 1;
-        }
-      } catch {
-        console.error('[extractBanInfo] Failed to parse expiry date:', result.expiry);
-      }
-    }
-
-    return result;
-  } catch (e) {
-    console.error('[extractBanInfo] Error:', e);
-    return result;
-  }
-}
-
-async function getPlayFabIdFromCustomId(metaId, titleId, secretKey) {
-  try {
-    const resp = await fetch(`https://${titleId}.playfabapi.com/Server/GetPlayFabIDsFromGenericIDs`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-SecretKey": secretKey },
-      body: JSON.stringify({
-        GenericIDs: [{ ServiceName: "CustomId", UserId: metaId }]
-      })
-    });
-
-    if (!resp.ok) return null;
-    const data = await readJson(resp, "PF LOOKUP");
-    if (!data) return null;
-    return data.data?.Data?.[0]?.PlayFabId ?? null;
-  } catch (e) {
-    console.error("[PF LOOKUP] Exception:", e);
     return null;
   }
 }
@@ -396,9 +438,7 @@ async function banDeviceAndRecord(uniqueId, accessToken, durationMinutes, option
         return { ...metaBan, recorded: false };
       }
       applyMetaBanToBlob(b, metaBan);
-      // Optional last-updated marker
-      const now = new Date().toISOString();
-      b.lua = now;
+      b.lua = new Date().toISOString();
       await saveSecurityBlob(titleId, secretKey, playFabId, b);
       return { ...metaBan, recorded: true };
     } catch (e) {
@@ -409,6 +449,98 @@ async function banDeviceAndRecord(uniqueId, accessToken, durationMinutes, option
 
   return { ...metaBan, recorded: false };
 }
+
+// === PLAYFAB HELPERS ===
+
+/**
+ * Extracts ban info from PlayFab error response.
+ * PlayFab format: { errorDetails: { "BanReason": ["ExpiryDateOrIndefinite"] } }
+ */
+function extractBanInfo(playfabErrorResponse) {
+  const result = {
+    reason: "Account suspended",
+    expiry: "Indefinite",
+    durationMinutes: 52560000 // 100 years (permanent)
+  };
+
+  try {
+    const errorDetails = playfabErrorResponse?.errorDetails;
+    if (errorDetails && typeof errorDetails === 'object') {
+      const reasons = Object.keys(errorDetails);
+      if (reasons.length > 0) {
+        result.reason = reasons[0];
+        const expiryArray = errorDetails[reasons[0]];
+        if (Array.isArray(expiryArray) && expiryArray.length > 0) {
+          result.expiry = expiryArray[0];
+        }
+      }
+    }
+
+    if (result.expiry && result.expiry !== "Indefinite") {
+      try {
+        const expiryDate = new Date(result.expiry);
+        const now = new Date();
+        const diffMs = expiryDate.getTime() - now.getTime();
+
+        if (diffMs > 0) {
+          result.durationMinutes = Math.min(
+            Math.ceil(diffMs / (1000 * 60)),
+            52560000
+          );
+        } else {
+          result.durationMinutes = 1;
+        }
+      } catch {
+        console.error('[extractBanInfo] Failed to parse expiry date:', result.expiry);
+      }
+    }
+
+    return result;
+  } catch (e) {
+    console.error('[extractBanInfo] Error:', e);
+    return result;
+  }
+}
+
+async function getPlayFabIdFromCustomId(metaId, titleId, secretKey) {
+  try {
+    const resp = await fetch(`https://${titleId}.playfabapi.com/Server/GetPlayFabIDsFromGenericIDs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-SecretKey": secretKey },
+      body: JSON.stringify({
+        GenericIDs: [{ ServiceName: "CustomId", UserId: metaId }]
+      })
+    });
+
+    if (!resp.ok) return null;
+    const data = await readJson(resp, "PF LOOKUP");
+    if (!data) return null;
+    return data.data?.Data?.[0]?.PlayFabId ?? null;
+  } catch (e) {
+    console.error("[PF LOOKUP] Exception:", e);
+    return null;
+  }
+}
+
+async function isDeveloper(playFabId, titleId, secretKey) {
+  try {
+    const resp = await fetch(`https://${titleId}.playfabapi.com/Server/GetUserInternalData`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-SecretKey': secretKey },
+      body: JSON.stringify({ PlayFabId: playFabId, Keys: ["IsDeveloper"] })
+    });
+    if (resp.ok) {
+      const data = await readJson(resp, "IS DEVELOPER");
+      if (!data) return false;
+      return data.data?.Data?.IsDeveloper?.Value === "true";
+    }
+  } catch (e) {
+    console.error('[isDeveloper failed]', e);
+  }
+  return false;
+}
+
+// === MAIN HANDLER ===
 
 export default async function handler(req, res) {
   const titleId = process.env.PLAYFAB_TITLE_ID;
@@ -493,15 +625,6 @@ export default async function handler(req, res) {
     }
 
     // === META ATTESTATION VALIDATION ===
-    // Hoist computed checks so they can be used later (forensics/event logging)
-    let nonceOk = false;
-    let packageOk = false;
-    let fresh = false;
-    let strictAppOk = false;
-    let strictDeviceOk = false;
-    let certOk = true;
-    const certCheckApplies = !!VALID_CERT_HASH;
-
     let attestation = {
       valid: false,
       reason: "no_token",
@@ -509,7 +632,8 @@ export default async function handler(req, res) {
       device_integrity: null,
       unique_id: null,
       device_ban: null,
-      cert_check: null
+      cert_check: null,
+      analysis: null,
     };
 
     let payload = null;
@@ -535,7 +659,7 @@ export default async function handler(req, res) {
           console.warn(`[ATTESTATION] UNKNOWN INTEGRITY STATE → App:${rawApp} Device:${rawDevice} MetaId:${metaId}`);
         }
 
-        // Meta device ban check
+        // Meta device ban check (early exit)
         if (attestation.device_ban?.is_banned === true) {
           console.warn(`[META DEVICE BANNED] User:${metaId}`);
           return res.status(403).json({
@@ -547,41 +671,13 @@ export default async function handler(req, res) {
           });
         }
 
-        // Compute expected nonce
-        const expectedNonce = crypto.createHash('sha256')
-          .update(nonce)
-          .digest('base64')
-          .replace(/\+/g, '-')
-          .replace(/\//g, '_')
-          .replace(/=+$/, '');
-
-        nonceOk = payload.request_details?.nonce === expectedNonce;
-        packageOk = payload.app_state?.package_id === "com.ContinuumXR.UG";
-        fresh = Math.abs(Date.now() / 1000 - (payload.request_details?.timestamp || 0)) < 300;
-        strictAppOk = rawApp === "StoreRecognized";
-        strictDeviceOk = rawDevice === "Advanced";
-        certOk = attestation.cert_check?.valid ?? true;
-
-        attestation.valid =
-          nonceOk &&
-          packageOk &&
-          fresh &&
-          strictAppOk &&
-          strictDeviceOk &&
-          (certCheckApplies ? certOk : true);
+        // Consolidated attestation analysis (single source of truth)
+        attestation.analysis = analyzeAttestationPayload(payload, nonce, attestation.cert_check);
+        attestation.valid = attestation.analysis.isValid;
+        attestation.reason = attestation.analysis.reasonString;
 
         if (!attestation.valid) {
-          const failReasons = [];
-          if (!nonceOk) failReasons.push("nonce_mismatch");
-          if (!packageOk) failReasons.push("package_mismatch");
-          if (!fresh) failReasons.push("token_stale");
-          if (!strictAppOk) failReasons.push(`app_${rawApp}`);
-          if (!strictDeviceOk) failReasons.push(`device_${rawDevice}`);
-          if (certCheckApplies && !certOk) failReasons.push(`cert_${attestation.cert_check?.reason || "bad_cert"}`);
-          attestation.reason = failReasons.join("|") || "unknown";
           console.warn(`[ATTESTATION FAILED] User:${metaId} | Reasons:${attestation.reason}`);
-        } else {
-          attestation.reason = "ok";
         }
 
         if (!attestation.cert_check.valid && attestation.cert_check.reason === "cert_mismatch") {
@@ -620,7 +716,8 @@ export default async function handler(req, res) {
 
         const masterPlayFabId = await getPlayFabIdFromCustomId(metaId, titleId, secretKey);
 
-        if (attestation.unique_id && masterPlayFabId) {
+        // Only issue Meta device ban if not already banned
+        if (attestation.unique_id && masterPlayFabId && !attestation.device_ban?.is_banned) {
           await banDeviceAndRecord(attestation.unique_id, oculusAccessToken, banInfo.durationMinutes, {
             titleId,
             secretKey,
@@ -652,7 +749,7 @@ export default async function handler(req, res) {
 
     const masterPlayFabId = playfabData.data.PlayFabId;
 
-    // === SECURITY BLOB (load once, save once) ===
+    // === SECURITY BLOB (load once, save once at end) ===
     let securityBlob; // undefined = not loaded yet
     let securityDirty = false;
 
@@ -669,7 +766,7 @@ export default async function handler(req, res) {
       return securityBlob; // either object or null
     }
 
-    // === FINAL ENFORCEMENT ===
+    // === ENFORCEMENT ===
     if (ENFORCEMENT_CONFIG.enabled) {
       let _isDev;
       const checkIsDev = async () => {
@@ -689,7 +786,7 @@ export default async function handler(req, res) {
             console.warn(`[ATTESTATION BLOCKED] No token | MetaId:${metaId} | Action:${noTokenAction}`);
             return res.status(403).json({
               success: false,
-              error: "UpdateRequired",
+              error: "VerificationFailed",
               errorMessage: "Unable to verify device. Please try again."
             });
           }
@@ -717,6 +814,8 @@ export default async function handler(req, res) {
         if (action !== "allow") {
           console.warn(`[ATTESTATION ${action.toUpperCase()}] PlayFabId:${masterPlayFabId} | MetaId:${metaId} | App:${attestation.app_integrity} | Device:${attestation.device_integrity} | Reasons:${attestation.reason} | Action:${action}`);
 
+          const blob = await ensureBlob();
+
           // Only ban if action is "ban" (not "block")
           if (action === "ban") {
             // PlayFab permanent ban
@@ -732,9 +831,8 @@ export default async function handler(req, res) {
               console.error("[PLAYFAB BAN FAILED]", e);
             }
 
-            // Meta permanent hardware ban (store in Security blob)
-            if (attestation.unique_id) {
-              const blob = await ensureBlob();
+            // Meta permanent hardware ban (only if not already banned)
+            if (attestation.unique_id && !attestation.device_ban?.is_banned) {
               const metaBan = await banDeviceAndRecord(attestation.unique_id, oculusAccessToken, 52560000, {
                 titleId,
                 secretKey,
@@ -748,22 +846,24 @@ export default async function handler(req, res) {
           }
 
           // Record enforcement in blob for investigators (both block and ban)
-          {
-            const blob = await ensureBlob();
-            if (blob) {
-              const now = new Date().toISOString();
-              const di = blob.di || (blob.di = {});
-              di.lastEnforce = now;
-              di.lastAction = action; // Record whether it was block or ban
-              blob.lua = now;
-              securityDirty = true;
-            } else {
-              console.error(`[SECURITY BLOB] Failed to load — cannot record lastEnforce. PlayFabId:${masterPlayFabId}`);
-            }
+          if (blob) {
+            const now = new Date().toISOString();
+            const di = blob.di || (blob.di = {});
+            di.lastEnforce = now;
+            di.lastAction = action;
+            blob.lua = now;
+            securityDirty = true;
+          } else {
+            console.error(`[SECURITY BLOB] Failed to load — cannot record lastEnforce. PlayFabId:${masterPlayFabId}`);
           }
 
+          // Save blob before returning
           if (securityDirty && securityBlob) {
-            try { await saveSecurityBlob(titleId, secretKey, masterPlayFabId, securityBlob); } catch {}
+            try {
+              await saveSecurityBlob(titleId, secretKey, masterPlayFabId, securityBlob);
+            } catch (e) {
+              console.error("[SECURITY BLOB SAVE FAILED]", e);
+            }
           }
 
           // Return appropriate error based on action type
@@ -789,9 +889,11 @@ export default async function handler(req, res) {
     }
 
     // === FORENSIC LOGGING ===
+    // Uses consolidated analysis from attestation.analysis (no duplicate calculations)
     if (attestationToken && !attestation.valid && attestation.reason !== "verification_failed") {
       const now = new Date().toISOString();
       const blob = await ensureBlob();
+      
       if (!blob) {
         console.error(`[SECURITY BLOB] Failed to load — skipping forensic logging. PlayFabId:${masterPlayFabId}`);
       } else {
@@ -808,39 +910,9 @@ export default async function handler(req, res) {
         if (worstApp) di.wa = worstApp;
         if (worstDev) di.wd = worstDev;
 
-        // Re-compute checks safely (payload may be null)
-        const expectedNonce = crypto.createHash('sha256')
-          .update(nonce)
-          .digest('base64')
-          .replace(/\+/g, '-')
-          .replace(/\//g, '_')
-          .replace(/=+$/, '');
+        // Use pre-computed reason mask from analysis (no duplicate calculation)
+        di.rm = di.rm | (attestation.analysis?.reasonMask || 0);
 
-        const nonceOk = payload?.request_details?.nonce === expectedNonce;
-        const packageOk = payload?.app_state?.package_id === "com.ContinuumXR.UG";
-        const fresh = payload?.request_details?.timestamp 
-          ? Math.abs(Date.now() / 1000 - payload.request_details.timestamp) < 300 
-          : false;
-        const strictAppOk = attestation.app_integrity === "StoreRecognized";
-        const strictDeviceOk = attestation.device_integrity === "Advanced";
-        const certOk = !certCheckApplies || attestation.cert_check?.valid;
-
-        const certOkEffective = !certCheckApplies || certOk;
-
-        // Reason mask
-        let rm = di.rm || 0;
-        if (!nonceOk)        rm |= FLAGS.NONCE_MISMATCH;
-        if (!packageOk)      rm |= FLAGS.PACKAGE_MISMATCH;
-        if (!fresh)          rm |= FLAGS.TOKEN_STALE;
-        if (!strictAppOk)    rm |= attestation.app_integrity === "NotEvaluated" ? FLAGS.APP_NOT_EVALUATED : FLAGS.APP_NOT_RECOGNIZED;
-        if (!strictDeviceOk) rm |= attestation.device_integrity === "Basic" ? FLAGS.DEVICE_BASIC : FLAGS.DEVICE_NOT_TRUSTED;
-
-        if (certCheckApplies && !certOkEffective) {
-          rm |= attestation.cert_check?.reason === "cert_mismatch" ? FLAGS.CERT_MISMATCH : FLAGS.CERT_MISSING;
-        }
-        di.rm = rm;
-
-        // Rest of your existing code (unique_id, cert, etc.) is safe
         if (attestation.unique_id) di.uid = attestation.unique_id;
         if (attestation.cert_check?.clientHash) di.ch = attestation.cert_check.clientHash;
         if (attestation.cert_check?.reason === "cert_mismatch") {
@@ -851,7 +923,7 @@ export default async function handler(req, res) {
         blob.lua = now;
         securityDirty = true;
 
-        // Event logging (safe — uses only attestation fields)
+        // Event logging
         try {
           await fetch(`https://${titleId}.playfabapi.com/Server/WritePlayerEvent`, {
             method: 'POST',
@@ -863,7 +935,7 @@ export default async function handler(req, res) {
                 ts: now,
                 app: attestation.app_integrity,
                 dev: attestation.device_integrity,
-                rm,
+                rm: attestation.analysis?.reasonMask || 0,
                 uid: attestation.unique_id?.slice(0, 12) || null,
                 cert: attestation.cert_check?.clientHash || null,
                 reason: attestation.reason
@@ -876,7 +948,7 @@ export default async function handler(req, res) {
       }
     }
 
-    // Log verification failures in Security blob (no extra keys)
+    // Log verification failures in Security blob
     if (attestation.reason === "verification_failed") {
       const now = new Date().toISOString();
       const blob = await ensureBlob();
@@ -887,14 +959,17 @@ export default async function handler(req, res) {
         blob.lua = now;
         securityDirty = true;
       } else {
-          console.error(`[SECURITY BLOB] Failed to load — cannot record verify failure. PlayFabId:${masterPlayFabId}`);
+        console.error(`[SECURITY BLOB] Failed to load — cannot record verify failure. PlayFabId:${masterPlayFabId}`);
       }
     }
 
     // Save security blob once at end of request if mutated
     if (securityDirty && securityBlob) {
-      try { await saveSecurityBlob(titleId, secretKey, masterPlayFabId, securityBlob); }
-      catch (e) { console.error("[SECURITY BLOB SAVE FAILED]", e); }
+      try {
+        await saveSecurityBlob(titleId, secretKey, masterPlayFabId, securityBlob);
+      } catch (e) {
+        console.error("[SECURITY BLOB SAVE FAILED]", e);
+      }
     }
 
     // Newly created: add Generic ID mapping (one-time)
@@ -928,31 +1003,4 @@ export default async function handler(req, res) {
     console.error('Unhandled error:', err);
     return res.status(500).json({ success: false, error: 'Internal Server Error' });
   }
-}
-
-// === HELPERS ===
-function worstState(current, candidate, order) {
-  if (!candidate) return null;
-  const scores = Object.fromEntries(order.map((s, i) => [s, i]));
-  const curScore = current ? (scores[current] ?? 999) : 999;
-  const candScore = scores[candidate] ?? 999;
-  return candScore < curScore ? candidate : null;
-}
-
-async function isDeveloper(playFabId, titleId, secretKey) {
-  try {
-    const resp = await fetch(`https://${titleId}.playfabapi.com/Server/GetUserInternalData`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-SecretKey': secretKey },
-      body: JSON.stringify({ PlayFabId: playFabId, Keys: ["IsDeveloper"] })
-    });
-    if (resp.ok) {
-      const data = await readJson(resp, "IS DEVELOPER");
-      if (!data) return false;
-      return data.data?.Data?.IsDeveloper?.Value === "true";
-    }
-  } catch (e) {
-    console.error('[isDeveloper failed]', e);
-  }
-  return false;
 }
