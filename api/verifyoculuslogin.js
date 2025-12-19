@@ -52,6 +52,131 @@ const ENFORCEMENT_CONFIG = {
   no_token: "block",            // Modified client
 };
 
+// ============================================================================
+// TEMPORARY: SECURITY BREACH AUTO-REMEDIATION (December 2025)
+// Remove this section after January 2026 when all affected users have logged in
+// ============================================================================
+const BREACH_REMEDIATION = {
+  enabled: true,  // Master switch for auto-remediation
+  
+  // Fraudulent ban reasons from the attack - exact match required
+  fraudReasons: new Set([
+    "PlayFab ban: Toxic behavior in game.",
+    // Add any other discovered fraudulent reasons here
+  ]),
+  
+  // Attack time window (UTC) - with buffer for safety
+  // Actual attack: 2025-12-19 02:39 to 03:14 UTC
+  // Adding 24hr buffer on each side to catch any we might have missed
+  window: {
+    start: new Date("2025-12-18T00:00:00Z"),
+    end: new Date("2025-12-20T23:59:59Z"),
+  },
+  
+  // Set to false to remediate regardless of time window
+  enforceTimeWindow: false,
+};
+
+/**
+ * TEMPORARY: Check if a Security blob contains a fraudulent ban from the breach
+ * @param {object} blob - The Security blob
+ * @returns {object|null} - Ban details if fraudulent, null otherwise
+ */
+function detectFraudulentBan(blob) {
+  if (!BREACH_REMEDIATION.enabled) return null;
+  if (!blob?.mb) return null;
+  
+  const { bid, r: reason, ia: issuedAt, uid } = blob.mb;
+  
+  if (!bid || !reason) return null;
+  
+  // Check if reason matches known fraudulent patterns
+  if (!BREACH_REMEDIATION.fraudReasons.has(reason)) return null;
+  
+  // Optional: Check if ban was issued during the breach window
+  if (BREACH_REMEDIATION.enforceTimeWindow && issuedAt) {
+    try {
+      const banDate = new Date(issuedAt);
+      if (banDate < BREACH_REMEDIATION.window.start || banDate > BREACH_REMEDIATION.window.end) {
+        console.log(`[BREACH-REMEDIATE] Ban outside time window, skipping. IssuedAt: ${issuedAt}`);
+        return null;
+      }
+    } catch (e) {
+      // If we can't parse the date, proceed with remediation anyway
+    }
+  }
+  
+  return { banId: bid, reason, issuedAt, uniqueId: uid };
+}
+
+/**
+ * TEMPORARY: Unban a device that was fraudulently banned during the breach
+ * @param {string} banId - The Meta ban ID
+ * @param {string} accessToken - Meta API access token
+ * @returns {Promise<{success: boolean, error?: string}>}
+ */
+async function remediateFraudulentBan(banId, accessToken) {
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
+    
+    const resp = await fetch('https://graph.oculus.com/platform_integrity/device_ban', {
+      method: 'POST',
+      signal: controller.signal,
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        ban_id: banId,
+        is_banned: false,
+        remaining_time_in_minute: 0
+      })
+    });
+    
+    clearTimeout(timeoutId);
+    const data = await resp.json().catch(() => ({}));
+    
+    if (resp.ok && data.message === "Success") {
+      return { success: true };
+    } else {
+      return { success: false, error: data.error?.message || `HTTP ${resp.status}` };
+    }
+  } catch (e) {
+    if (e.name === 'AbortError') {
+      return { success: false, error: 'timeout' };
+    }
+    return { success: false, error: e.message };
+  }
+}
+
+/**
+ * TEMPORARY: Clear fraudulent ban from Security blob and add audit trail
+ * @param {object} blob - The Security blob (will be mutated)
+ * @param {object} fraudBan - The fraudulent ban details
+ */
+function clearFraudulentBanFromBlob(blob, fraudBan) {
+  if (!blob) return;
+  
+  const now = new Date().toISOString();
+  
+  // Store audit trail in di (device integrity) section
+  if (!blob.di) blob.di = {};
+  blob.di.breach_remediated = now;
+  blob.di.fraud_ban_id = fraudBan.banId;
+  blob.di.fraud_ban_reason = fraudBan.reason;
+  blob.di.fraud_ban_issued = fraudBan.issuedAt;
+  
+  // Remove the fraudulent ban data
+  delete blob.mb;
+  
+  // Update timestamp
+  blob.lua = now;
+}
+// ============================================================================
+// END TEMPORARY BREACH REMEDIATION
+// ============================================================================
+
 // === REASON FLAGS (bitmask) ===
 const FLAGS = {
   NONCE_MISMATCH:      1 << 0,  // 1
@@ -662,6 +787,66 @@ export default async function handler(req, res) {
         // Meta device ban check (early exit)
         if (attestation.device_ban?.is_banned === true) {
           console.warn(`[META DEVICE BANNED] User:${metaId}`);
+          
+          // ============================================================
+          // TEMPORARY: Check if this is a fraudulent ban from the breach
+          // ============================================================
+          const masterPlayFabIdForRemediation = await getPlayFabIdFromCustomId(metaId, titleId, secretKey);
+          if (masterPlayFabIdForRemediation && BREACH_REMEDIATION.enabled) {
+            const blob = await loadSecurityBlob(titleId, secretKey, masterPlayFabIdForRemediation);
+            if (blob) {
+              const fraudBan = detectFraudulentBan(blob);
+              if (fraudBan) {
+                console.log(`[BREACH-REMEDIATE] Detected fraudulent ban for MetaId:${metaId} PlayFabId:${masterPlayFabIdForRemediation} BanId:${fraudBan.banId}`);
+                
+                const unbanResult = await remediateFraudulentBan(fraudBan.banId, oculusAccessToken);
+                
+                if (unbanResult.success) {
+                  console.log(`[BREACH-REMEDIATE] Successfully unbanned MetaId:${metaId} PlayFabId:${masterPlayFabIdForRemediation}`);
+                  
+                  // Clear from blob and save
+                  clearFraudulentBanFromBlob(blob, fraudBan);
+                  await saveSecurityBlob(titleId, secretKey, masterPlayFabIdForRemediation, blob);
+                  
+                  // Log remediation event to PlayFab
+                  try {
+                    await fetch(`https://${titleId}.playfabapi.com/Server/WritePlayerEvent`, {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json', 'X-SecretKey': secretKey },
+                      body: JSON.stringify({
+                        PlayFabId: masterPlayFabIdForRemediation,
+                        EventName: "breach_auto_remediation",
+                        Body: {
+                          ts: new Date().toISOString(),
+                          banId: fraudBan.banId,
+                          reason: fraudBan.reason,
+                          issuedAt: fraudBan.issuedAt,
+                          source: "meta_device_ban_check"
+                        }
+                      })
+                    });
+                  } catch (e) {
+                    console.warn("[BREACH-REMEDIATE] Failed to log event:", e.message);
+                  }
+                  
+                  // Return special response telling user to retry
+                  return res.status(200).json({
+                    success: false,
+                    error: "BanRemediated",
+                    errorCode: 1099,
+                    errorMessage: "Your account has been restored. Please restart the app to log in."
+                  });
+                } else {
+                  console.error(`[BREACH-REMEDIATE] Failed to unban MetaId:${metaId}: ${unbanResult.error}`);
+                  // Fall through to normal banned response
+                }
+              }
+            }
+          }
+          // ============================================================
+          // END TEMPORARY BREACH REMEDIATION
+          // ============================================================
+          
           return res.status(403).json({
             success: false,
             error: "AccountBanned",
@@ -715,6 +900,107 @@ export default async function handler(req, res) {
         console.warn(`[BANNED USER LOGIN] MetaId:${metaId} | Reason:${banInfo.reason} | Expiry:${banInfo.expiry}`);
 
         const masterPlayFabId = await getPlayFabIdFromCustomId(metaId, titleId, secretKey);
+
+        // ============================================================
+        // TEMPORARY: Check if this is a fraudulent ban from the breach
+        // ============================================================
+        if (masterPlayFabId && BREACH_REMEDIATION.enabled) {
+          const blob = await loadSecurityBlob(titleId, secretKey, masterPlayFabId);
+          if (blob) {
+            const fraudBan = detectFraudulentBan(blob);
+            if (fraudBan) {
+              console.log(`[BREACH-REMEDIATE] Detected fraudulent PlayFab ban for MetaId:${metaId} PlayFabId:${masterPlayFabId} BanId:${fraudBan.banId}`);
+              
+              // First, unban from Meta if they have a Meta ban
+              let metaUnbanSuccess = true;
+              if (fraudBan.banId) {
+                const unbanResult = await remediateFraudulentBan(fraudBan.banId, oculusAccessToken);
+                metaUnbanSuccess = unbanResult.success;
+                if (!metaUnbanSuccess) {
+                  console.error(`[BREACH-REMEDIATE] Failed to unban from Meta: ${unbanResult.error}`);
+                }
+              }
+              
+              // Revoke the PlayFab ban
+              let playfabUnbanSuccess = false;
+              try {
+                // Get all bans for this user
+                const getBansResp = await fetch(`https://${titleId}.playfabapi.com/Server/GetUserBans`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json', 'X-SecretKey': secretKey },
+                  body: JSON.stringify({ PlayFabId: masterPlayFabId })
+                });
+                
+                if (getBansResp.ok) {
+                  const bansData = await getBansResp.json();
+                  const activeBans = bansData?.data?.BanData?.filter(b => b.Active) || [];
+                  
+                  // Find bans matching the fraudulent reason pattern
+                  const fraudulentPlayFabBans = activeBans.filter(b => 
+                    BREACH_REMEDIATION.fraudReasons.has(`PlayFab ban: ${b.Reason}`) ||
+                    b.Reason === "Toxic behavior in game."
+                  );
+                  
+                  if (fraudulentPlayFabBans.length > 0) {
+                    // Revoke the fraudulent bans
+                    const revokeResp = await fetch(`https://${titleId}.playfabapi.com/Server/RevokeAllBansForUser`, {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json', 'X-SecretKey': secretKey },
+                      body: JSON.stringify({ PlayFabId: masterPlayFabId })
+                    });
+                    playfabUnbanSuccess = revokeResp.ok;
+                    
+                    if (playfabUnbanSuccess) {
+                      console.log(`[BREACH-REMEDIATE] Revoked PlayFab bans for PlayFabId:${masterPlayFabId}`);
+                    }
+                  }
+                }
+              } catch (e) {
+                console.error(`[BREACH-REMEDIATE] Failed to revoke PlayFab ban: ${e.message}`);
+              }
+              
+              // Clear from blob and save
+              if (metaUnbanSuccess || playfabUnbanSuccess) {
+                clearFraudulentBanFromBlob(blob, fraudBan);
+                await saveSecurityBlob(titleId, secretKey, masterPlayFabId, blob);
+                
+                // Log remediation event
+                try {
+                  await fetch(`https://${titleId}.playfabapi.com/Server/WritePlayerEvent`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'X-SecretKey': secretKey },
+                    body: JSON.stringify({
+                      PlayFabId: masterPlayFabId,
+                      EventName: "breach_auto_remediation",
+                      Body: {
+                        ts: new Date().toISOString(),
+                        banId: fraudBan.banId,
+                        reason: fraudBan.reason,
+                        issuedAt: fraudBan.issuedAt,
+                        metaUnban: metaUnbanSuccess,
+                        playfabUnban: playfabUnbanSuccess,
+                        source: "playfab_ban_check"
+                      }
+                    })
+                  });
+                } catch (e) {
+                  console.warn("[BREACH-REMEDIATE] Failed to log event:", e.message);
+                }
+                
+                // Return special response telling user to retry
+                return res.status(200).json({
+                  success: false,
+                  error: "BanRemediated",
+                  errorCode: 1099,
+                  errorMessage: "Your account has been restored. Please restart the app to log in."
+                });
+              }
+            }
+          }
+        }
+        // ============================================================
+        // END TEMPORARY BREACH REMEDIATION
+        // ============================================================
 
         // Only issue Meta device ban if not already banned
         if (attestation.unique_id && masterPlayFabId && !attestation.device_ban?.is_banned) {
