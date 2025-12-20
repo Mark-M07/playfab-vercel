@@ -698,7 +698,12 @@ export default async function handler(req, res) {
       });
       bodyData = querystring.parse(rawBody);
     } else {
-      bodyData = req.body;
+      try {
+        bodyData = req.body;
+      } catch (e) {
+        console.warn(`[PROBE] Malformed JSON | UA: ${req.headers['user-agent'] || 'unknown'} | IP: ${req.headers['x-forwarded-for'] || 'unknown'}`);
+        return res.status(400).json({ success: false, error: "Unable to authenticate. Please try again." });
+      }
     }
 
     const { userId: receivedUserId, nonce, attestationToken } = bodyData;
