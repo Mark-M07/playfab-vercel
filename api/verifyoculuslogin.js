@@ -751,9 +751,8 @@ export default async function handler(req, res) {
       }
       return res.status(403).json({
         success: false,
-        error: "VerificationFailed",
-        errorCode: 1003,
-        errorMessage: "Unable to verify device. Please try again."
+        error: "AuthenticationFailed",
+        errorMessage: "Unable to authenticate. Please try again."
       });
     }
 
@@ -1047,8 +1046,7 @@ export default async function handler(req, res) {
       // Non-ban error
       return res.status(400).json({
         success: false,
-        error: "Authentication failed",
-        errorCode: playfabData.errorCode || 0,
+        error: "AuthenticationFailed",
         errorMessage: playfabData.errorMessage || "Unable to authenticate. Please try again."
       });
     }
@@ -1092,8 +1090,8 @@ export default async function handler(req, res) {
             console.warn(`[ATTESTATION BLOCKED] No token | MetaId:${metaId} | Action:${noTokenAction}`);
             return res.status(403).json({
               success: false,
-              error: "VerificationFailed",
-              errorMessage: "Unable to verify device. Please try again."
+              error: "AuthenticationFailed",
+              errorMessage: "Unable to authenticate. Please try again."
             });
           }
         }
@@ -1106,9 +1104,8 @@ export default async function handler(req, res) {
           console.warn(`[ATTESTATION BLOCKED] Verification failed | MetaId:${metaId} | Action:${verifyAction}`);
           return res.status(403).json({
             success: false,
-            error: "VerificationFailed",
-            errorCode: 1003,
-            errorMessage: "Unable to verify device. Please try again."
+            error: "AuthenticationFailed",
+            errorMessage: "Unable to authenticate. Please try again."
           });
         }
       }
@@ -1185,8 +1182,7 @@ export default async function handler(req, res) {
             // action === "block" - reject but don't ban
             return res.status(403).json({
               success: false,
-              error: "AuthenticationBlocked",
-              errorCode: 1004,
+              error: "AuthenticationFailed",
               errorMessage: "Unable to authenticate. Please try again."
             });
           }
