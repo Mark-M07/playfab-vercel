@@ -706,6 +706,11 @@ export default async function handler(req, res) {
       }
     }
 
+    if (!bodyData) {
+      console.warn(`[PROBE] Empty body | UA: ${req.headers['user-agent'] || 'unknown'} | IP: ${req.headers['x-forwarded-for'] || 'unknown'}`);
+      return res.status(400).json({ success: false, error: "Unable to authenticate. Please try again." });
+    }
+
     const { userId: receivedUserId, nonce, attestationToken } = bodyData;
     if (!receivedUserId || !nonce) {
       return res.status(400).json({ success: false, error: "Unable to authenticate. Please try again." });
@@ -737,9 +742,19 @@ export default async function handler(req, res) {
       oculusBody = await oculusResp.text();
     } catch (e) {
       clearTimeout(nonceTimeoutId);
-      if (e.name === 'AbortError') console.error("[NONCE VALIDATE] Request timed out after 10s");
-      else console.error("[NONCE VALIDATE] Request failed:", e.message);
-      return res.status(503).json({ success: false, error: 'Service temporarily unavailable' });
+      if (e.name === 'AbortError') {
+        console.error("[NONCE VALIDATE] Request timed out after 10s");
+        console.warn(`[ATTESTATION BLOCKED] Verification failed | MetaId:${metaId} | Action:block`);
+      } else {
+        console.error("[NONCE VALIDATE] Request failed:", e.message);
+        console.warn(`[ATTESTATION BLOCKED] Verification failed | MetaId:${metaId} | Action:block`);
+      }
+      return res.status(403).json({
+        success: false,
+        error: "VerificationFailed",
+        errorCode: 1003,
+        errorMessage: "Unable to verify device. Please try again."
+      });
     }
 
     let nonceValidateResult;
