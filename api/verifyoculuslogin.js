@@ -805,7 +805,7 @@ export default async function handler(req, res) {
 
         // Meta device ban check (early exit)
         if (attestation.device_ban?.is_banned === true) {
-          console.warn(`[META DEVICE BANNED] User:${metaId}`);
+          console.warn(`[META DEVICE BANNED] User:${metaId} | BanId:${attestation.device_ban?.ban_id || 'unknown'} | UniqueId:${attestation.unique_id || 'unknown'} | RemainingTime:${attestation.device_ban?.remaining_ban_time || 'unknown'}`);
           
           // ============================================================
           // TEMPORARY: Check if this is a fraudulent ban from the breach
@@ -871,7 +871,7 @@ export default async function handler(req, res) {
             error: "AccountBanned",
             errorCode: 1002,
             errorMessage: "This device is banned.",
-            banInfo: { reason: "Device banned", expiry: attestation.device_ban.remaining_ban_time || "Permanent" }
+            banInfo: { reason: "Device banned", expiry: (attestation.device_ban.remaining_ban_time >= 52560000) ? "Indefinite" : attestation.device_ban.remaining_ban_time }
           });
         }
 
