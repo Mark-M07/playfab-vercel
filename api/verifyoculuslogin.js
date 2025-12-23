@@ -871,7 +871,7 @@ export default async function handler(req, res) {
             error: "AccountBanned",
             errorCode: 1002,
             errorMessage: "This device is banned.",
-            banInfo: { reason: "Device banned", expiry: (attestation.device_ban.remaining_ban_time >= 52560000) ? "Indefinite" : attestation.device_ban.remaining_ban_time }
+            banInfo: { reason: "Device banned", expiry: (attestation.device_ban.remaining_ban_time >= 5256000) ? "Indefinite" : attestation.device_ban.remaining_ban_time }
           });
         }
 
