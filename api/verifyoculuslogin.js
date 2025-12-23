@@ -805,10 +805,7 @@ export default async function handler(req, res) {
 
         // Meta device ban check (early exit)
         if (attestation.device_ban?.is_banned === true) {
-          console.warn(`[META DEVICE BANNED] User:${metaId} | BanId:${attestation.device_ban?.ban_id || 'unknown'} | UniqueId:${attestation.unique_id || 'unknown'} | RemainingTime:${attestation.device_ban?.remaining_ban_time || 'unknown'}`);
-          console.warn(`[META DEVICE BANNED DEBUG] Full device_ban object: ${JSON.stringify(attestation.device_ban)}`);
-          console.warn(`[META DEVICE BANNED DEBUG] Full payload.device_ban: ${JSON.stringify(payload?.device_ban)}`);
-          console.warn(`[META DEVICE BANNED DEBUG] Full payload.device_state: ${JSON.stringify(payload?.device_state)}`);
+          console.warn(`[META DEVICE BANNED] User:${metaId} | UniqueId:${attestation.unique_id || 'unknown'} | RemainingTime:${attestation.device_ban?.remaining_ban_time || 'unknown'}`);
           
           // ============================================================
           // TEMPORARY: Check if this is a fraudulent ban from the breach
