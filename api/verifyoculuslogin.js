@@ -807,25 +807,27 @@ export default async function handler(req, res) {
         if (attestation.device_ban?.is_banned === true) {
           console.warn(`[META DEVICE BANNED] User:${metaId} | UniqueId:${attestation.unique_id || 'unknown'} | RemainingTime:${attestation.device_ban?.remaining_ban_time || 'unknown'}`);
           
+          // Get PlayFab ID (needed for ban reason lookup)
+          const playFabId = await getPlayFabIdFromCustomId(metaId, titleId, secretKey);
+
           // ============================================================
           // TEMPORARY: Check if this is a fraudulent ban from the breach
           // ============================================================
-          const masterPlayFabIdForRemediation = await getPlayFabIdFromCustomId(metaId, titleId, secretKey);
-          if (masterPlayFabIdForRemediation && BREACH_REMEDIATION.enabled) {
-            const blob = await loadSecurityBlob(titleId, secretKey, masterPlayFabIdForRemediation);
+          if (playFabId && BREACH_REMEDIATION.enabled) {
+            const blob = await loadSecurityBlob(titleId, secretKey, playFabId);
             if (blob) {
               const fraudBan = detectFraudulentBan(blob);
               if (fraudBan) {
-                console.log(`[BREACH-REMEDIATE] Detected fraudulent ban for MetaId:${metaId} PlayFabId:${masterPlayFabIdForRemediation} BanId:${fraudBan.banId}`);
+                console.log(`[BREACH-REMEDIATE] Detected fraudulent ban for MetaId:${metaId} PlayFabId:${playFabId} BanId:${fraudBan.banId}`);
                 
                 const unbanResult = await remediateFraudulentBan(fraudBan.banId, oculusAccessToken);
                 
                 if (unbanResult.success) {
-                  console.log(`[BREACH-REMEDIATE] Successfully unbanned MetaId:${metaId} PlayFabId:${masterPlayFabIdForRemediation}`);
+                  console.log(`[BREACH-REMEDIATE] Successfully unbanned MetaId:${metaId} PlayFabId:${playFabId}`);
                   
                   // Clear from blob and save
                   clearFraudulentBanFromBlob(blob, fraudBan);
-                  await saveSecurityBlob(titleId, secretKey, masterPlayFabIdForRemediation, blob);
+                  await saveSecurityBlob(titleId, secretKey, playFabId, blob);
                   
                   // Log remediation event to PlayFab
                   try {
@@ -833,7 +835,7 @@ export default async function handler(req, res) {
                       method: 'POST',
                       headers: { 'Content-Type': 'application/json', 'X-SecretKey': secretKey },
                       body: JSON.stringify({
-                        PlayFabId: masterPlayFabIdForRemediation,
+                        PlayFabId: playFabId,
                         EventName: "breach_auto_remediation",
                         Body: {
                           ts: new Date().toISOString(),
@@ -866,6 +868,28 @@ export default async function handler(req, res) {
           // END TEMPORARY BREACH REMEDIATION
           // ============================================================
           
+          // Look up actual ban reason from PlayFab
+          let banReason = "Security violation"; // Default fallback
+          if (playFabId) {
+            try {
+              const getBansResp = await fetch(`https://${titleId}.playfabapi.com/Server/GetUserBans`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'X-SecretKey': secretKey },
+                body: JSON.stringify({ PlayFabId: playFabId })
+              });
+              
+              if (getBansResp.ok) {
+                const bansData = await getBansResp.json();
+                const activeBan = bansData?.data?.BanData?.find(b => b.Active);
+                if (activeBan?.Reason) {
+                  banReason = activeBan.Reason;
+                }
+              }
+            } catch (e) {
+              console.warn("[GET BAN REASON] Failed to fetch from PlayFab:", e.message);
+            }
+          }
+
           const remainingDays = parseInt(attestation.device_ban.remaining_ban_time, 10) || 0;
 
           return res.status(403).json({
@@ -873,7 +897,7 @@ export default async function handler(req, res) {
             error: "AccountBanned",
             errorCode: 1002,
             errorMessage: "This device is banned.",
-            banInfo: { reason: "Security violation", expiry: (remainingDays >= 3650) ? "Indefinite" : attestation.device_ban.remaining_ban_time }
+            banInfo: { reason: banReason, expiry: (remainingDays >= 3650) ? "Indefinite" : attestation.device_ban.remaining_ban_time }
           });
         }
 
