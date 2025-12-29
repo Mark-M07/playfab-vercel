@@ -866,12 +866,14 @@ export default async function handler(req, res) {
           // END TEMPORARY BREACH REMEDIATION
           // ============================================================
           
+          const remainingDays = parseInt(attestation.device_ban.remaining_ban_time, 10) || 0;
+
           return res.status(403).json({
             success: false,
             error: "AccountBanned",
             errorCode: 1002,
             errorMessage: "This device is banned.",
-            banInfo: { reason: "Device banned", expiry: (attestation.device_ban.remaining_ban_time >= 5256000) ? "Indefinite" : attestation.device_ban.remaining_ban_time }
+            banInfo: { reason: "Device banned", expiry: (remainingDays >= 3650) ? "Indefinite" : attestation.device_ban.remaining_ban_time }
           });
         }
 
