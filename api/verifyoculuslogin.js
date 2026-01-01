@@ -1004,32 +1004,9 @@ export default async function handler(req, res) {
                   console.log(`[ATTESTATION-UNBAN] Unbanned MetaId:${metaId} PlayFabId:${playFabId} | Meta:${unbanResult.metaSuccess} PlayFab:${unbanResult.playFabSuccess}`);
                   console.log(`[ATTESTATION-UNBAN] Current device state: App:${attestation.app_integrity} Device:${attestation.device_integrity} MetaId:${metaId}`);
                   
-                  // Clear from blob and save
+                  // Record unban in blob and save
                   recordAttestationUnban(blob, attestBan, unbanResult);
                   await saveSecurityBlob(titleId, secretKey, playFabId, blob);
-                  
-                  // Log remediation event to PlayFab
-                  try {
-                    await fetch(`https://${titleId}.playfabapi.com/Server/WritePlayerEvent`, {
-                      method: 'POST',
-                      headers: { 'Content-Type': 'application/json', 'X-SecretKey': secretKey },
-                      body: JSON.stringify({
-                        PlayFabId: playFabId,
-                        EventName: "attestation_auto_unban",
-                        Body: {
-                          ts: new Date().toISOString(),
-                          banId: attestBan.banId,
-                          reason: attestBan.reason,
-                          issuedAt: attestBan.issuedAt,
-                          metaUnban: unbanResult.metaSuccess,
-                          playFabUnban: unbanResult.playFabSuccess,
-                          source: "meta_device_ban_check"
-                        }
-                      })
-                    });
-                  } catch (e) {
-                    console.warn("[ATTESTATION-UNBAN] Failed to log event:", e.message);
-                  }
                   
                   // Mark as unbanned so we skip the banned response and continue login
                   attestationUnbanned = true;
@@ -1187,32 +1164,9 @@ export default async function handler(req, res) {
               if (unbanResult.metaSuccess || unbanResult.playFabSuccess) {
                 console.log(`[ATTESTATION-UNBAN] Unbanned MetaId:${metaId} PlayFabId:${masterPlayFabId} | Meta:${unbanResult.metaSuccess} PlayFab:${unbanResult.playFabSuccess}`);
                 
-                // Clear from blob and save
+                // Record unban in blob and save
                 recordAttestationUnban(blob, attestBan, unbanResult);
                 await saveSecurityBlob(titleId, secretKey, masterPlayFabId, blob);
-                
-                // Log remediation event
-                try {
-                  await fetch(`https://${titleId}.playfabapi.com/Server/WritePlayerEvent`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json', 'X-SecretKey': secretKey },
-                    body: JSON.stringify({
-                      PlayFabId: masterPlayFabId,
-                      EventName: "attestation_auto_unban",
-                      Body: {
-                        ts: new Date().toISOString(),
-                        banId: attestBan.banId,
-                        reason: attestBan.reason,
-                        issuedAt: attestBan.issuedAt,
-                        metaUnban: unbanResult.metaSuccess,
-                        playFabUnban: unbanResult.playFabSuccess,
-                        source: "playfab_ban_check"
-                      }
-                    })
-                  });
-                } catch (e) {
-                  console.warn("[ATTESTATION-UNBAN] Failed to log event:", e.message);
-                }
                 
                 // Update in-memory attestation state so downstream code doesn't re-ban
                 if (attestation.device_ban) {
@@ -1438,7 +1392,7 @@ export default async function handler(req, res) {
                attestation.reason === "device_Basic|device_NotTrusted");
             
             const errorMessage = isDeviceIntegrityOnly
-              ? "Security check failed.\nA factory reset of your device is required to play."
+              ? "Security check failed.\nA factory reset of your device is recommended."
               : "Unable to authenticate. Please try again.";
             
             return res.status(403).json({
@@ -1485,29 +1439,6 @@ export default async function handler(req, res) {
 
         blob.lua = now;
         securityDirty = true;
-
-        // Event logging
-        try {
-          await fetch(`https://${titleId}.playfabapi.com/Server/WritePlayerEvent`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'X-SecretKey': secretKey },
-            body: JSON.stringify({
-              PlayFabId: masterPlayFabId,
-              EventName: "device_integrity_failure",
-              Body: {
-                ts: now,
-                app: attestation.app_integrity,
-                dev: attestation.device_integrity,
-                rm: attestation.analysis?.reasonMask || 0,
-                uid: attestation.unique_id?.slice(0, 12) || null,
-                cert: attestation.cert_check?.clientHash || null,
-                reason: attestation.reason
-              }
-            })
-          });
-        } catch (e) {
-          console.warn("[EVENT LOG FAILED]", e);
-        }
       }
     }
 
