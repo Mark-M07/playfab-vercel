@@ -467,38 +467,84 @@ function applyMetaBanToBlob(blob, { uniqueId, banId, issuedAt, reason, durationM
 }
 
 // === DEVICE BAN REGISTRY ===
-// Stores UniqueId → ban info mapping in Title Internal Data for cross-account lookups
+// Stores all UniqueId → ban info mappings in a single Title Internal Data key
+
+const DEVICE_BAN_REGISTRY_KEY = "DeviceBanRegistry";
 
 /**
- * Register a device ban in Title Internal Data for cross-account tracking
- * Key format: "DeviceBan:{uniqueId}" to avoid collisions
+ * Load the device ban registry from Title Internal Data
+ * Returns an object mapping UniqueId → ban info, or empty object if not found
  */
-async function registerDeviceBan(titleId, secretKey, uniqueId, playFabId, metaId, reason) {
-  if (!uniqueId) return;
-  
-  const key = `DeviceBan:${uniqueId}`;
-  const value = JSON.stringify({
-    playFabId,
-    metaId,
-    reason,
-    bannedAt: new Date().toISOString()
-  });
-  
+async function loadDeviceBanRegistry(titleId, secretKey) {
+  try {
+    const resp = await fetch(`https://${titleId}.playfabapi.com/Admin/GetTitleInternalData`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-SecretKey': secretKey },
+      body: JSON.stringify({ Keys: [DEVICE_BAN_REGISTRY_KEY] })
+    });
+    
+    if (!resp.ok) {
+      console.warn(`[DEVICE BAN REGISTRY] Load failed: ${resp.status}`);
+      return {};
+    }
+    
+    const data = await resp.json().catch(() => null);
+    const value = data?.data?.Data?.[DEVICE_BAN_REGISTRY_KEY];
+    
+    if (!value) return {};
+    
+    return JSON.parse(value);
+  } catch (e) {
+    console.warn(`[DEVICE BAN REGISTRY] Load exception:`, e.message);
+    return {};
+  }
+}
+
+/**
+ * Save the device ban registry to Title Internal Data
+ */
+async function saveDeviceBanRegistry(titleId, secretKey, registry) {
   try {
     const resp = await fetch(`https://${titleId}.playfabapi.com/Admin/SetTitleInternalData`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-SecretKey': secretKey },
-      body: JSON.stringify({ Key: key, Value: value })
+      body: JSON.stringify({ 
+        Key: DEVICE_BAN_REGISTRY_KEY, 
+        Value: JSON.stringify(registry) 
+      })
     });
     
-    if (resp.ok) {
-      console.log(`[DEVICE BAN REGISTRY] Stored UniqueId:${uniqueId.slice(0, 16)}... → PlayFabId:${playFabId}`);
-    } else {
+    if (!resp.ok) {
       const text = await resp.text().catch(() => "");
-      console.error(`[DEVICE BAN REGISTRY] Failed to store: ${resp.status} ${text.slice(0, 200)}`);
+      console.error(`[DEVICE BAN REGISTRY] Save failed: ${resp.status} ${text.slice(0, 200)}`);
+      return false;
     }
+    return true;
   } catch (e) {
-    console.error(`[DEVICE BAN REGISTRY] Exception:`, e.message);
+    console.error(`[DEVICE BAN REGISTRY] Save exception:`, e.message);
+    return false;
+  }
+}
+
+/**
+ * Register a device ban in the registry for cross-account tracking
+ */
+async function registerDeviceBan(titleId, secretKey, uniqueId, playFabId, metaId, reason) {
+  if (!uniqueId) return;
+  
+  const registry = await loadDeviceBanRegistry(titleId, secretKey);
+  
+  // Add or update entry
+  registry[uniqueId] = {
+    playFabId,
+    metaId,
+    reason,
+    bannedAt: new Date().toISOString()
+  };
+  
+  const saved = await saveDeviceBanRegistry(titleId, secretKey, registry);
+  if (saved) {
+    console.log(`[DEVICE BAN REGISTRY] Stored UniqueId:${uniqueId.slice(0, 16)}... → PlayFabId:${playFabId}`);
   }
 }
 
@@ -509,30 +555,8 @@ async function registerDeviceBan(titleId, secretKey, uniqueId, playFabId, metaId
 async function lookupDeviceBan(titleId, secretKey, uniqueId) {
   if (!uniqueId) return null;
   
-  const key = `DeviceBan:${uniqueId}`;
-  
-  try {
-    const resp = await fetch(`https://${titleId}.playfabapi.com/Admin/GetTitleInternalData`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-SecretKey': secretKey },
-      body: JSON.stringify({ Keys: [key] })
-    });
-    
-    if (!resp.ok) {
-      console.warn(`[DEVICE BAN REGISTRY] Lookup failed: ${resp.status}`);
-      return null;
-    }
-    
-    const data = await resp.json().catch(() => null);
-    const value = data?.data?.Data?.[key];
-    
-    if (!value) return null;
-    
-    return JSON.parse(value);
-  } catch (e) {
-    console.warn(`[DEVICE BAN REGISTRY] Lookup exception:`, e.message);
-    return null;
-  }
+  const registry = await loadDeviceBanRegistry(titleId, secretKey);
+  return registry[uniqueId] || null;
 }
 
 /**
