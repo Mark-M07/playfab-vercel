@@ -873,6 +873,7 @@ export default async function handler(req, res) {
                 
                 if (unbanResult.metaSuccess || unbanResult.playFabSuccess) {
                   console.log(`[ATTESTATION-UNBAN] Unbanned MetaId:${metaId} PlayFabId:${playFabId} | Meta:${unbanResult.metaSuccess} PlayFab:${unbanResult.playFabSuccess}`);
+                  console.log(`[ATTESTATION-UNBAN] Current device state: App:${attestation.app_integrity} Device:${attestation.device_integrity} MetaId:${metaId}`);
                   
                   // Clear from blob and save
                   recordAttestationUnban(blob, attestBan, unbanResult);
