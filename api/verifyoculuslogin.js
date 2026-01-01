@@ -113,45 +113,50 @@ function detectAttestationBanForUnban(blob) {
 
 /**
  * TEMPORARY: Unban device and revoke PlayFab ban for attestation false positives
- * @param {string} banId - The Meta ban ID
+ * @param {string|null} uniqueId - The Meta device unique ID (null if no active Meta ban to revoke)
  * @param {string} playFabId - The PlayFab ID
  * @param {string} accessToken - Meta API access token
  * @param {string} titleId - PlayFab title ID
  * @param {string} secretKey - PlayFab secret key
  * @returns {Promise<{metaSuccess: boolean, playFabSuccess: boolean, error?: string}>}
  */
-async function remediateAttestationBan(banId, playFabId, accessToken, titleId, secretKey) {
+async function remediateAttestationBan(uniqueId, playFabId, accessToken, titleId, secretKey) {
   const result = { metaSuccess: false, playFabSuccess: false };
   
-  // 1. Revoke Meta device ban
-  try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 10000);
-    
-    const metaResp = await fetch('https://graph.oculus.com/platform_integrity/device_ban', {
-      method: 'POST',
-      signal: controller.signal,
-      headers: {
-        'Authorization': `Bearer ${accessToken}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        ban_id: banId,
-        is_banned: false,
-        remaining_time_in_minute: 0
-      })
-    });
-    
-    clearTimeout(timeoutId);
-    const metaData = await metaResp.json().catch(() => ({}));
-    
-    if (metaResp.ok && metaData.message === "Success") {
-      result.metaSuccess = true;
-    } else {
-      result.error = `Meta unban failed: ${metaData.error?.message || `HTTP ${metaResp.status}`}`;
+  // 1. Revoke Meta device ban using unique_id (only if uniqueId provided, meaning active Meta ban exists)
+  if (!uniqueId) {
+    // No Meta ban to revoke - this is intentional, not an error
+    result.metaSuccess = true;  // Nothing to do = success
+  } else {
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 10000);
+      
+      const metaResp = await fetch('https://graph.oculus.com/platform_integrity/device_ban', {
+        method: 'POST',
+        signal: controller.signal,
+        headers: {
+          'Authorization': `Bearer ${accessToken}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          unique_id: uniqueId,
+          is_banned: false,
+          remaining_time_in_minute: 0
+        })
+      });
+      
+      clearTimeout(timeoutId);
+      const metaData = await metaResp.json().catch(() => ({}));
+      
+      if (metaResp.ok && metaData.message === "Success") {
+        result.metaSuccess = true;
+      } else {
+        result.error = `Meta unban failed: ${metaData.error?.message || `HTTP ${metaResp.status}`}`;
+      }
+    } catch (e) {
+      result.error = e.name === 'AbortError' ? 'Meta unban timeout' : `Meta unban error: ${e.message}`;
     }
-  } catch (e) {
-    result.error = e.name === 'AbortError' ? 'Meta unban timeout' : e.message;
   }
   
   // 2. Revoke PlayFab ban (get active bans and revoke)
@@ -993,7 +998,7 @@ export default async function handler(req, res) {
                 console.log(`[ATTESTATION-UNBAN] Detected eligible ban for MetaId:${metaId} PlayFabId:${playFabId} Reason:${attestBan.reason}`);
                 
                 const unbanResult = await remediateAttestationBan(
-                  attestBan.banId, 
+                  attestation.unique_id,  // Fresh unique_id from current attestation
                   playFabId, 
                   oculusAccessToken, 
                   titleId, 
@@ -1153,8 +1158,11 @@ export default async function handler(req, res) {
             if (attestBan) {
               console.log(`[ATTESTATION-UNBAN] Detected eligible PlayFab ban for MetaId:${metaId} PlayFabId:${masterPlayFabId} Reason:${attestBan.reason}`);
               
+              // Only call Meta unban API if there's an active Meta device ban
+              const hasActiveMetaBan = attestation.device_ban?.is_banned === true;
+              
               const unbanResult = await remediateAttestationBan(
-                attestBan.banId, 
+                hasActiveMetaBan ? attestation.unique_id : null,  // Only pass unique_id if Meta ban is active
                 masterPlayFabId, 
                 oculusAccessToken, 
                 titleId, 
