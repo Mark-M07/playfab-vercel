@@ -467,13 +467,14 @@ function applyMetaBanToBlob(blob, { uniqueId, banId, issuedAt, reason, durationM
 }
 
 // === DEVICE BAN REGISTRY ===
-// Stores all UniqueId → ban info mappings in a single Title Internal Data key
+// Stores all UniqueId → account info mappings in a single Title Internal Data key
+// Used to link alt accounts to the original banned account
 
 const DEVICE_BAN_REGISTRY_KEY = "DeviceBanRegistry";
 
 /**
  * Load the device ban registry from Title Internal Data
- * Returns an object mapping UniqueId → ban info, or empty object if not found
+ * Returns an object mapping UniqueId → { playFabId, metaId }, or empty object if not found
  */
 async function loadDeviceBanRegistry(titleId, secretKey) {
   try {
@@ -550,7 +551,7 @@ async function registerDeviceBan(titleId, secretKey, uniqueId, playFabId, metaId
 
 /**
  * Look up original banned account by device UniqueId
- * Returns { playFabId, metaId, reason, bannedAt } or null if not found
+ * Returns { playFabId, metaId } or null if not found
  */
 async function lookupDeviceBan(titleId, secretKey, uniqueId) {
   if (!uniqueId) return null;
@@ -560,31 +561,32 @@ async function lookupDeviceBan(titleId, secretKey, uniqueId) {
 }
 
 /**
- * Create a linked Security blob on an alt account that shares a banned device
+ * Create a linked Security blob on an alt account by copying from the original banned account
+ * Adds linkedAlt marker so admin knows this is a copy
  */
-async function createLinkedBanBlob(titleId, secretKey, altPlayFabId, uniqueId, originalBanInfo) {
+async function createLinkedBanBlob(titleId, secretKey, altPlayFabId, originalPlayFabId) {
+  // Load the original account's Security blob
+  const originalBlob = await loadSecurityBlob(titleId, secretKey, originalPlayFabId);
+  
+  if (!originalBlob) {
+    console.warn(`[DEVICE BAN REGISTRY] Could not load original blob from PlayFabId:${originalPlayFabId}`);
+    return false;
+  }
+  
   const now = new Date().toISOString();
   
-  const blob = {
-    v: 2,
-    di: {
-      linkedBan: true,
-      linkedTo: originalBanInfo.playFabId,
-      linkedAt: now,
-      originalReason: originalBanInfo.reason,
-      originalBannedAt: originalBanInfo.bannedAt
-    },
-    mb: {
-      uid: uniqueId,
-      r: `Linked device ban (see: ${originalBanInfo.playFabId})`,
-      ia: now
-    },
-    lua: now
-  };
+  // Copy the blob and add alt account markers
+  const altBlob = JSON.parse(JSON.stringify(originalBlob)); // Deep copy
+  
+  if (!altBlob.di) altBlob.di = {};
+  altBlob.di.linkedAlt = true;
+  altBlob.di.linkedTo = originalPlayFabId;
+  altBlob.di.linkedAt = now;
+  altBlob.lua = now;
   
   try {
-    await saveSecurityBlob(titleId, secretKey, altPlayFabId, blob);
-    console.log(`[DEVICE BAN REGISTRY] Created linked blob on PlayFabId:${altPlayFabId} → original:${originalBanInfo.playFabId}`);
+    await saveSecurityBlob(titleId, secretKey, altPlayFabId, altBlob);
+    console.log(`[DEVICE BAN REGISTRY] Copied blob to alt PlayFabId:${altPlayFabId} ← original:${originalPlayFabId}`);
     return true;
   } catch (e) {
     console.error(`[DEVICE BAN REGISTRY] Failed to create linked blob:`, e.message);
@@ -1065,7 +1067,7 @@ export default async function handler(req, res) {
                     secretKey, 
                     attestation.unique_id, 
                     playFabId, 
-                    metaId, 
+                    metaId,
                     existingBlob.mb.r
                   );
                 }
@@ -1074,9 +1076,9 @@ export default async function handler(req, res) {
                 const originalBan = await lookupDeviceBan(titleId, secretKey, attestation.unique_id);
                 
                 if (originalBan) {
-                  // Found the original banned account - create linked Security blob on this alt
-                  console.log(`[DEVICE BAN REGISTRY] Alt account detected: MetaId:${metaId} PlayFabId:${playFabId} | Original: PlayFabId:${originalBan.playFabId} Reason:${originalBan.reason}`);
-                  await createLinkedBanBlob(titleId, secretKey, playFabId, attestation.unique_id, originalBan);
+                  // Found the original banned account - copy their Security blob to this alt
+                  console.log(`[DEVICE BAN REGISTRY] Alt account detected: MetaId:${metaId} PlayFabId:${playFabId} | Original: PlayFabId:${originalBan.playFabId}`);
+                  await createLinkedBanBlob(titleId, secretKey, playFabId, originalBan.playFabId);
                 } else {
                   // Not in registry - could be legacy ban or rotated UniqueId
                   console.log(`[DEVICE BAN REGISTRY] No registry entry for UniqueId:${attestation.unique_id.slice(0, 16)}... | MetaId:${metaId} (legacy ban or rotated ID)`);
