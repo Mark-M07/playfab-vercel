@@ -27,8 +27,6 @@ const ENFORCEMENT_CONFIG = {
   enabled: true, // Master switch - set to true to enable enforcement
   
   // Device integrity failures
-  // Changed from "ban" to "block" (January 2026) - too many false positives
-  // from legitimate players with rooted/modified devices but clean UG accounts
   device_NotTrusted: "block",   // Block login, prompt factory reset
   device_Basic: "block",        // Block login, prompt factory reset
   
@@ -70,6 +68,8 @@ const ATTESTATION_UNBAN = {
     // Compound reasons with only device integrity failures
     "Attestation: device_NotTrusted|device_Basic",
     "Attestation: device_Basic|device_NotTrusted",
+    // PlayFab-friendly reason (original technical reason was overwritten after Meta ban was revoked and re-issued)
+    "PlayFab ban: Security violation",
   ]),
   
   // Reasons that indicate actual cheating - never auto-unban these
@@ -539,8 +539,7 @@ async function registerDeviceBan(titleId, secretKey, uniqueId, playFabId, metaId
   registry[uniqueId] = {
     playFabId,
     metaId,
-    reason,
-    bannedAt: new Date().toISOString()
+    reason
   };
   
   const saved = await saveDeviceBanRegistry(titleId, secretKey, registry);
