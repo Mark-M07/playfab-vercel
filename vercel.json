@@ -2,7 +2,7 @@
   "crons": [
     {
       "path": "/api/rotatetoken",
-      "schedule": "0 * * * *"
+      "schedule": "0 */3 * * *"
     }
   ]
 }
