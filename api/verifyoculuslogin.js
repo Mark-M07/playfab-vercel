@@ -27,6 +27,8 @@ const ENFORCEMENT_CONFIG = {
   enabled: true, // Master switch - set to true to enable enforcement
   
   // Device integrity failures
+  // Changed from "ban" to "block" (January 2026) - too many false positives
+  // from legitimate players with rooted/modified devices but clean UG accounts
   device_NotTrusted: "block",   // Block login, prompt factory reset
   device_Basic: "block",        // Block login, prompt factory reset
   
@@ -462,6 +464,108 @@ function applyMetaBanToBlob(blob, { uniqueId, banId, issuedAt, reason, durationM
     r: reason ?? blob.mb.r ?? "Security violation",
     dm: typeof durationMinutes === "number" ? durationMinutes : (blob.mb.dm ?? 52560000),
   });
+}
+
+// === DEVICE BAN REGISTRY ===
+// Stores UniqueId → ban info mapping in Title Internal Data for cross-account lookups
+
+/**
+ * Register a device ban in Title Internal Data for cross-account tracking
+ * Key format: "DeviceBan:{uniqueId}" to avoid collisions
+ */
+async function registerDeviceBan(titleId, secretKey, uniqueId, playFabId, metaId, reason) {
+  if (!uniqueId) return;
+  
+  const key = `DeviceBan:${uniqueId}`;
+  const value = JSON.stringify({
+    playFabId,
+    metaId,
+    reason,
+    bannedAt: new Date().toISOString()
+  });
+  
+  try {
+    const resp = await fetch(`https://${titleId}.playfabapi.com/Admin/SetTitleInternalData`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-SecretKey': secretKey },
+      body: JSON.stringify({ Key: key, Value: value })
+    });
+    
+    if (resp.ok) {
+      console.log(`[DEVICE BAN REGISTRY] Stored UniqueId:${uniqueId.slice(0, 16)}... → PlayFabId:${playFabId}`);
+    } else {
+      const text = await resp.text().catch(() => "");
+      console.error(`[DEVICE BAN REGISTRY] Failed to store: ${resp.status} ${text.slice(0, 200)}`);
+    }
+  } catch (e) {
+    console.error(`[DEVICE BAN REGISTRY] Exception:`, e.message);
+  }
+}
+
+/**
+ * Look up original banned account by device UniqueId
+ * Returns { playFabId, metaId, reason, bannedAt } or null if not found
+ */
+async function lookupDeviceBan(titleId, secretKey, uniqueId) {
+  if (!uniqueId) return null;
+  
+  const key = `DeviceBan:${uniqueId}`;
+  
+  try {
+    const resp = await fetch(`https://${titleId}.playfabapi.com/Admin/GetTitleInternalData`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-SecretKey': secretKey },
+      body: JSON.stringify({ Keys: [key] })
+    });
+    
+    if (!resp.ok) {
+      console.warn(`[DEVICE BAN REGISTRY] Lookup failed: ${resp.status}`);
+      return null;
+    }
+    
+    const data = await resp.json().catch(() => null);
+    const value = data?.data?.Data?.[key];
+    
+    if (!value) return null;
+    
+    return JSON.parse(value);
+  } catch (e) {
+    console.warn(`[DEVICE BAN REGISTRY] Lookup exception:`, e.message);
+    return null;
+  }
+}
+
+/**
+ * Create a linked Security blob on an alt account that shares a banned device
+ */
+async function createLinkedBanBlob(titleId, secretKey, altPlayFabId, uniqueId, originalBanInfo) {
+  const now = new Date().toISOString();
+  
+  const blob = {
+    v: 2,
+    di: {
+      linkedBan: true,
+      linkedTo: originalBanInfo.playFabId,
+      linkedAt: now,
+      originalReason: originalBanInfo.reason,
+      originalBannedAt: originalBanInfo.bannedAt
+    },
+    mb: {
+      uid: uniqueId,
+      r: `Linked device ban (see: ${originalBanInfo.playFabId})`,
+      ia: now
+    },
+    lua: now
+  };
+  
+  try {
+    await saveSecurityBlob(titleId, secretKey, altPlayFabId, blob);
+    console.log(`[DEVICE BAN REGISTRY] Created linked blob on PlayFabId:${altPlayFabId} → original:${originalBanInfo.playFabId}`);
+    return true;
+  } catch (e) {
+    console.error(`[DEVICE BAN REGISTRY] Failed to create linked blob:`, e.message);
+    return false;
+  }
 }
 
 // === META API HELPERS ===
@@ -919,6 +1023,43 @@ export default async function handler(req, res) {
           
           // If we just unbanned them, skip the banned response and continue login
           if (!attestationUnbanned) {
+            // Check Security blob status and handle registry backfill / alt account detection
+            if (playFabId && attestation.unique_id) {
+              const existingBlob = await loadSecurityBlob(titleId, secretKey, playFabId);
+              const hasBanEvidence = existingBlob?.mb?.r;
+              
+              if (hasBanEvidence) {
+                // This account has ban evidence - it's the original banned account (or already linked)
+                // Check if we need to backfill the registry
+                const existingRegistry = await lookupDeviceBan(titleId, secretKey, attestation.unique_id);
+                
+                if (!existingRegistry) {
+                  // Backfill: add this account to the registry
+                  console.log(`[DEVICE BAN REGISTRY] Backfilling from existing ban: PlayFabId:${playFabId} Reason:${existingBlob.mb.r}`);
+                  await registerDeviceBan(
+                    titleId, 
+                    secretKey, 
+                    attestation.unique_id, 
+                    playFabId, 
+                    metaId, 
+                    existingBlob.mb.r
+                  );
+                }
+              } else {
+                // No ban evidence on this account - check if this is an alt account
+                const originalBan = await lookupDeviceBan(titleId, secretKey, attestation.unique_id);
+                
+                if (originalBan) {
+                  // Found the original banned account - create linked Security blob on this alt
+                  console.log(`[DEVICE BAN REGISTRY] Alt account detected: MetaId:${metaId} PlayFabId:${playFabId} | Original: PlayFabId:${originalBan.playFabId} Reason:${originalBan.reason}`);
+                  await createLinkedBanBlob(titleId, secretKey, playFabId, attestation.unique_id, originalBan);
+                } else {
+                  // Not in registry - could be legacy ban or rotated UniqueId
+                  console.log(`[DEVICE BAN REGISTRY] No registry entry for UniqueId:${attestation.unique_id.slice(0, 16)}... | MetaId:${metaId} (legacy ban or rotated ID)`);
+                }
+              }
+            }
+            
             // Look up actual ban reason from PlayFab
             let banReason = "Security violation"; // Default fallback
             if (playFabId) {
@@ -1099,13 +1240,17 @@ export default async function handler(req, res) {
 
         // Only issue Meta device ban if not already banned
         if (attestation.unique_id && masterPlayFabId && !attestation.device_ban?.is_banned) {
-          await banDeviceAndRecord(attestation.unique_id, oculusAccessToken, banInfo.durationMinutes, {
+          const metaBan = await banDeviceAndRecord(attestation.unique_id, oculusAccessToken, banInfo.durationMinutes, {
             titleId,
             secretKey,
             playFabId: masterPlayFabId,
             banReason: `PlayFab ban: ${banInfo.reason}`,
             metaId
           });
+          // Register in device ban registry for cross-account lookups
+          if (metaBan.success) {
+            await registerDeviceBan(titleId, secretKey, attestation.unique_id, masterPlayFabId, metaId, `PlayFab ban: ${banInfo.reason}`);
+          }
         } else if (!masterPlayFabId) {
           console.error(`[CRITICAL] Failed to resolve MasterPlayFabId for banned MetaId:${metaId} — Meta ban NOT stored!`);
         }
@@ -1220,7 +1365,11 @@ export default async function handler(req, res) {
                 banReason: `Attestation: ${attestation.reason}`,
                 metaId
               });
-              if (metaBan.success && metaBan.recorded) securityDirty = true;
+              if (metaBan.success && metaBan.recorded) {
+                securityDirty = true;
+                // Register in device ban registry for cross-account lookups
+                await registerDeviceBan(titleId, secretKey, attestation.unique_id, masterPlayFabId, metaId, `Attestation: ${attestation.reason}`);
+              }
             }
           }
 
