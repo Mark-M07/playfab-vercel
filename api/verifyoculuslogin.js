@@ -1068,7 +1068,7 @@ export default async function handler(req, res) {
             }
             
             // Look up actual ban reason from PlayFab
-            let banReason = "Security violation"; // Default fallback
+            let banReason = "Device ban"; // Default for device-banned users with no PlayFab account
             if (playFabId) {
               try {
                 const getBansResp = await fetch(`https://${titleId}.playfabapi.com/Server/GetUserBans`, {
