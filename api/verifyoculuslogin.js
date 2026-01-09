@@ -2,7 +2,6 @@
 import fetch from 'node-fetch';
 import querystring from 'node:querystring';
 import crypto from 'crypto';
-import dns from 'node:dns/promises';
 
 // === CONFIGURATION ===
 const KNOWN_APP_STATES = ["NotRecognized", "NotEvaluated", "StoreRecognized"];
@@ -52,248 +51,6 @@ const ENFORCEMENT_CONFIG = {
   // No attestation token provided
   no_token: "block",            // Modified client
 };
-
-// ============================================================================
-// SECURITY: DNS VERIFICATION & CIRCUIT BREAKER
-// Protection against DNS hijacking / BGP attacks / MITM on outbound requests
-// 
-// How it works:
-// 1. Before making PlayFab calls, we verify DNS resolves to legitimate PlayFab IPs
-// 2. If DNS is poisoned, we retry up to 3 times (may hit clean DNS cache)
-// 3. Circuit breaker stops mass-banning if attack slips through
-//
-// If attack is detected:
-// - Logs [SECURITY DNS ATTACK] alerts
-// - User sees "Service temporarily unavailable" and can retry
-// - To stop an active attack: Redeploy the Vercel function (clears DNS cache)
-// ============================================================================
-
-// PlayFab static IP ranges (from PlayFab dashboard - Settings > API Features)
-// Update these if PlayFab publishes new ranges
-const PLAYFAB_VALID_IP_RANGES = [
-  // /28 ranges (16 IPs each)
-  { start: '20.120.128.144', end: '20.120.128.159' },
-  { start: '20.120.129.32', end: '20.120.129.47' },
-  { start: '20.120.129.96', end: '20.120.129.111' },
-  { start: '20.120.129.160', end: '20.120.129.175' },
-  { start: '20.120.129.240', end: '20.120.129.255' },
-  { start: '20.120.130.208', end: '20.120.130.223' },
-  { start: '20.120.131.0', end: '20.120.131.15' },
-  { start: '20.120.131.240', end: '20.120.131.255' },
-  { start: '20.120.132.32', end: '20.120.132.47' },
-  { start: '20.120.132.208', end: '20.120.132.223' },
-  { start: '20.120.133.64', end: '20.120.133.79' },
-  { start: '20.120.133.112', end: '20.120.133.127' },
-  { start: '20.252.116.240', end: '20.252.116.255' },
-  { start: '20.252.117.240', end: '20.252.117.255' },
-  { start: '20.252.118.0', end: '20.252.118.15' },
-  { start: '20.252.118.48', end: '20.252.118.63' },
-  { start: '20.252.118.64', end: '20.252.118.79' },
-  { start: '20.252.118.208', end: '20.252.118.223' },
-  { start: '20.252.119.16', end: '20.252.119.31' },
-  { start: '20.252.119.176', end: '20.252.119.191' },
-  { start: '20.252.119.192', end: '20.252.119.207' },
-  { start: '20.252.119.240', end: '20.252.119.255' },
-  { start: '20.252.119.48', end: '20.252.119.63' },
-  { start: '20.252.119.96', end: '20.252.119.111' },
-  { start: '20.51.84.128', end: '20.51.84.143' },
-  { start: '20.51.84.160', end: '20.51.84.175' },
-  { start: '20.51.84.176', end: '20.51.84.191' },
-  { start: '20.51.84.240', end: '20.51.84.255' },
-  { start: '20.51.85.32', end: '20.51.85.47' },
-  { start: '20.51.85.64', end: '20.51.85.79' },
-  { start: '20.51.85.128', end: '20.51.85.143' },
-  { start: '20.51.85.176', end: '20.51.85.191' },
-  { start: '20.72.226.112', end: '20.72.226.127' },
-  { start: '20.72.226.160', end: '20.72.226.175' },
-  { start: '52.250.84.16', end: '52.250.84.31' },
-  { start: '52.250.87.96', end: '52.250.87.111' },
-  { start: '52.250.87.160', end: '52.250.87.175' },
-  { start: '52.250.87.192', end: '52.250.87.207' },
-  { start: '48.210.5.64', end: '48.210.5.127' },   // /26
-  { start: '48.210.5.128', end: '48.210.5.191' },  // /26
-  { start: '48.210.6.0', end: '48.210.7.255' },    // /23
-  // /25 ranges (128 IPs each)
-  { start: '20.9.200.0', end: '20.9.200.127' },
-  { start: '20.9.200.128', end: '20.9.200.255' },
-  // /23 range (512 IPs)
-  { start: '20.42.182.0', end: '20.42.183.255' },
-  // Individual IPs
-  { start: '34.213.208.16', end: '34.213.208.16' },
-  { start: '34.216.170.167', end: '34.216.170.167' },
-  { start: '52.13.201.178', end: '52.13.201.178' },
-  { start: '57.154.81.226', end: '57.154.81.227' }, // /31
-];
-
-// DNS verification config
-const DNS_CONFIG = {
-  maxRetries: 3,           // Retry DNS check up to 3 times
-  retryDelayMs: 100,       // Wait 100ms between retries
-  cacheFailuresFor: 30000, // Cache DNS failure state for 30s to avoid hammering
-};
-
-// Track DNS failure state (in-memory, resets on cold start)
-let dnsFailureState = {
-  lastFailure: null,
-  consecutiveFailures: 0,
-};
-
-/**
- * Convert IP string to numeric value for comparison
- */
-function ipToNumber(ip) {
-  const parts = ip.split('.').map(Number);
-  return ((parts[0] << 24) >>> 0) + (parts[1] << 16) + (parts[2] << 8) + parts[3];
-}
-
-/**
- * Check if an IP is within PlayFab's valid ranges
- */
-function isValidPlayFabIP(ip) {
-  const ipNum = ipToNumber(ip);
-  
-  for (const range of PLAYFAB_VALID_IP_RANGES) {
-    const startNum = ipToNumber(range.start);
-    const endNum = ipToNumber(range.end);
-    if (ipNum >= startNum && ipNum <= endNum) {
-      return true;
-    }
-  }
-  return false;
-}
-
-/**
- * Verify that PlayFab DNS resolves to legitimate IPs
- * Includes retry logic to handle transient DNS issues
- * 
- * @returns {{ valid: boolean, ips: string[], invalidIps: string[], attempt: number, error?: string }}
- */
-async function verifyPlayFabDNS(titleId) {
-  const hostname = `${titleId}.playfabapi.com`;
-  
-  // Check if we're in a recent failure state (avoid hammering during attack)
-  if (dnsFailureState.lastFailure) {
-    const elapsed = Date.now() - dnsFailureState.lastFailure;
-    if (elapsed < DNS_CONFIG.cacheFailuresFor && dnsFailureState.consecutiveFailures >= 3) {
-      console.warn(`[SECURITY DNS] Skipping check - in failure cooldown (${Math.round(elapsed/1000)}s ago)`);
-      return { valid: false, ips: [], invalidIps: [], cached: true };
-    }
-  }
-  
-  for (let attempt = 1; attempt <= DNS_CONFIG.maxRetries; attempt++) {
-    try {
-      const ips = await dns.resolve4(hostname);
-      const invalidIps = ips.filter(ip => !isValidPlayFabIP(ip));
-      
-      if (invalidIps.length === 0) {
-        // Success! Clear failure state
-        dnsFailureState.lastFailure = null;
-        dnsFailureState.consecutiveFailures = 0;
-        return { valid: true, ips, invalidIps: [], attempt };
-      }
-      
-      // DNS returned invalid IPs - this is an attack!
-      console.error(`[SECURITY DNS ATTACK] ⚠️ ALERT: DNS hijacking detected! Attempt ${attempt}/${DNS_CONFIG.maxRetries}`);
-      console.error(`[SECURITY DNS ATTACK] Host: ${hostname}`);
-      console.error(`[SECURITY DNS ATTACK] Invalid IPs: ${invalidIps.join(', ')}`);
-      console.error(`[SECURITY DNS ATTACK] All resolved IPs: ${ips.join(', ')}`);
-      console.error(`[SECURITY DNS ATTACK] Action: Redeploy Vercel to clear DNS cache`);
-      
-      if (attempt < DNS_CONFIG.maxRetries) {
-        // Wait and retry - might get clean DNS on next attempt
-        await new Promise(r => setTimeout(r, DNS_CONFIG.retryDelayMs));
-      }
-      
-    } catch (e) {
-      // DNS resolution failed entirely - likely network issue, not attack
-      console.warn(`[SECURITY DNS] Resolution failed for ${hostname} (attempt ${attempt}): ${e.message}`);
-      
-      if (attempt < DNS_CONFIG.maxRetries) {
-        await new Promise(r => setTimeout(r, DNS_CONFIG.retryDelayMs));
-      }
-    }
-  }
-  
-  // All retries exhausted
-  dnsFailureState.lastFailure = Date.now();
-  dnsFailureState.consecutiveFailures++;
-  
-  console.error(`[SECURITY DNS ATTACK] ❌ All ${DNS_CONFIG.maxRetries} verification attempts failed!`);
-  console.error(`[SECURITY DNS ATTACK] Consecutive failures: ${dnsFailureState.consecutiveFailures}`);
-  
-  return { valid: false, ips: [], invalidIps: [], exhausted: true };
-}
-
-// ============================================================================
-// CIRCUIT BREAKER: Anomaly Detection for Ban Rate
-// Stops mass-banning if an attack somehow slips through DNS verification
-// ============================================================================
-
-const banRateTracker = {
-  timestamps: [],        // Array of timestamps when Meta bans were issued
-  windowMs: 300000,      // 5 minute sliding window
-  threshold: 15,         // Open circuit if >15 bans in window
-  circuitOpen: false,
-  circuitOpenedAt: null,
-  cooldownMs: 60000,     // 1 minute cooldown when circuit opens
-};
-
-/**
- * Record a Meta ban event and check if we should open the circuit breaker
- * @returns {boolean} true if anomaly detected (circuit is now open)
- */
-function recordMetaBanAndCheckAnomaly() {
-  const now = Date.now();
-  
-  // Clean old entries outside window
-  banRateTracker.timestamps = banRateTracker.timestamps.filter(
-    ts => now - ts < banRateTracker.windowMs
-  );
-  
-  // Add new ban
-  banRateTracker.timestamps.push(now);
-  
-  // Check threshold
-  if (banRateTracker.timestamps.length >= banRateTracker.threshold) {
-    if (!banRateTracker.circuitOpen) {
-      banRateTracker.circuitOpen = true;
-      banRateTracker.circuitOpenedAt = now;
-      console.error(`[SECURITY CIRCUIT BREAKER] ⚠️ OPENED! ${banRateTracker.timestamps.length} Meta bans in ${banRateTracker.windowMs/1000}s`);
-      console.error(`[SECURITY CIRCUIT BREAKER] Meta ban sync SUSPENDED for ${banRateTracker.cooldownMs/1000}s`);
-      console.error(`[SECURITY CIRCUIT BREAKER] PlayFab bans will still work, only Meta device bans paused`);
-    }
-    return true;
-  }
-  
-  return false;
-}
-
-/**
- * Check if circuit breaker allows Meta ban sync
- * @returns {boolean} true if Meta bans are allowed
- */
-function canSyncMetaBan() {
-  if (!banRateTracker.circuitOpen) return true;
-  
-  const now = Date.now();
-  const elapsed = now - banRateTracker.circuitOpenedAt;
-  
-  if (elapsed > banRateTracker.cooldownMs) {
-    // Cooldown expired, close circuit
-    console.log(`[SECURITY CIRCUIT BREAKER] Cooldown expired, resuming Meta ban sync`);
-    banRateTracker.circuitOpen = false;
-    banRateTracker.circuitOpenedAt = null;
-    // Keep timestamps for continued monitoring
-    return true;
-  }
-  
-  // Circuit still open
-  return false;
-}
-
-// ============================================================================
-// END SECURITY ADDITIONS
-// ============================================================================
 
 // ============================================================================
 // TEMPORARY: DEVICE ATTESTATION AUTO-UNBAN (January 2026)
@@ -907,7 +664,6 @@ async function verifyAttestationWithMeta(token, accessToken) {
 
 /**
  * Bans a device via Meta's API.
- * Now includes circuit breaker check.
  */
 async function banDevice(uniqueId, accessToken, durationMinutes = 52560000, options = {}) {
   const { banReason = "Security violation", metaId = "unknown" } = options;
@@ -915,12 +671,6 @@ async function banDevice(uniqueId, accessToken, durationMinutes = 52560000, opti
   if (!uniqueId) {
     console.warn('[META DEVICE BAN] No unique_id available - cannot ban device');
     return { success: false, error: 'No unique_id' };
-  }
-
-  // Check circuit breaker BEFORE making the ban call
-  if (!canSyncMetaBan()) {
-    console.warn(`[META DEVICE BAN] BLOCKED by circuit breaker | MetaId:${metaId}`);
-    return { success: false, error: 'circuit_breaker', blocked: true };
   }
 
   const controller = new AbortController();
@@ -944,9 +694,6 @@ async function banDevice(uniqueId, accessToken, durationMinutes = 52560000, opti
     const data = (await readJson(resp, "META DEVICE BAN")) || {};
 
     if (data.message === "Success" && data.ban_id) {
-      // Record this ban for anomaly detection
-      recordMetaBanAndCheckAnomaly();
-      
       const durationDisplay = durationMinutes >= 52560000 ? 'PERMANENT' : `${durationMinutes} minutes`;
       console.log(`[META DEVICE BAN] Success | MetaId:${metaId} | UniqueId:${uniqueId} | Duration:${durationDisplay} | BanId:${data.ban_id}`);
       return { success: true, banId: data.ban_id, issuedAt: new Date().toISOString(), reason: banReason, durationMinutes, uniqueId };
@@ -1113,29 +860,6 @@ export default async function handler(req, res) {
     return res.status(405).json({ success: false, error: "Method Not Allowed" });
   }
 
-  // ============================================================================
-  // SECURITY: Verify PlayFab DNS with retry logic
-  // Detects DNS hijacking / BGP attacks that redirect PlayFab traffic
-  // Retries up to 3 times before failing - handles transient DNS issues
-  // ============================================================================
-  const dnsCheck = await verifyPlayFabDNS(titleId);
-  if (!dnsCheck.valid) {
-    // Log detailed alert for monitoring
-    if (dnsCheck.cached) {
-      console.warn(`[SECURITY] Login blocked - DNS in failure cooldown`);
-    } else {
-      console.error(`[SECURITY] Login blocked - DNS verification failed after ${DNS_CONFIG.maxRetries} attempts`);
-    }
-    
-    // Generic error to client - they should retry (may get clean DNS)
-    return res.status(503).json({ 
-      success: false, 
-      error: "Service temporarily unavailable",
-      errorMessage: "Unable to connect. Please try again."
-    });
-  }
-  // ============================================================================
-
   try {
     // === Parse body ===
     let bodyData;
@@ -1174,20 +898,26 @@ export default async function handler(req, res) {
     }
 
     // === Oculus Nonce Validation ===
+    const nonceController = new AbortController();
+    const nonceTimeoutId = setTimeout(() => nonceController.abort(), 10000);
+
+    let oculusResp;
     let oculusBody;
     try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 10000);
-
-      const oculusResp = await fetch(
-        `https://graph.oculus.com/user_nonce_validate?nonce=${encodeURIComponent(nonce)}&user_id=${encodeURIComponent(receivedUserId)}&access_token=${encodeURIComponent(oculusAccessToken)}`,
-        { signal: controller.signal }
-      );
-      clearTimeout(timeoutId);
-
+      oculusResp = await fetch("https://graph.oculus.com/user_nonce_validate", {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${oculusAccessToken}`,
+          'Content-Type': 'application/x-www-form-urlencoded'
+        },
+        body: querystring.stringify({ nonce, user_id: metaId }),
+        signal: nonceController.signal
+      });
+      clearTimeout(nonceTimeoutId);
       oculusBody = await oculusResp.text();
     } catch (e) {
-      if (e?.name === 'AbortError') {
+      clearTimeout(nonceTimeoutId);
+      if (e.name === 'AbortError') {
         console.error("[NONCE VALIDATE] Request timed out after 10s");
         console.warn(`[ATTESTATION BLOCKED] Verification failed | MetaId:${metaId} | Action:block`);
       } else {
@@ -1201,19 +931,19 @@ export default async function handler(req, res) {
       });
     }
 
-    let oculusJson;
+    let nonceValidateResult;
     try {
-      oculusJson = JSON.parse(oculusBody);
+      nonceValidateResult = JSON.parse(oculusBody);
     } catch {
       console.error("[NONCE VALIDATE] Non-JSON response:", oculusBody.slice(0, 200));
-      return res.status(403).json({ success: false, error: "AuthenticationFailed", errorMessage: "Unable to authenticate. Please try again." });
+      return res.status(400).json({ success: false, error: "Unable to authenticate. Please try again." });
     }
 
-    if (!oculusJson.is_valid) {
-      return res.status(403).json({ success: false, error: "AuthenticationFailed", errorMessage: "Invalid credentials." });
+    if (!oculusResp.ok || !nonceValidateResult.is_valid) {
+      return res.status(400).json({ success: false, error: "Unable to authenticate. Please try again." });
     }
 
-    // === Attestation (optional) ===
+    // === META ATTESTATION VALIDATION ===
     let attestation = {
       valid: false,
       reason: "no_token",
@@ -1221,59 +951,54 @@ export default async function handler(req, res) {
       device_integrity: null,
       unique_id: null,
       device_ban: null,
-      cert_check: { valid: true, reason: "no_cert_data" },
-      analysis: null
+      cert_check: null,
+      analysis: null,
     };
 
-    // Security blob tracking - load once, mutate as needed, save once at end
-    let securityBlob = null;
-    let securityDirty = false;
-
-    // Track if user was unbanned during this request (skip downstream ban logic)
-    let attestationUnbanned = false;
-
+    let payload = null;
     if (attestationToken) {
-      const payload = await verifyAttestationWithMeta(attestationToken, oculusAccessToken);
+      payload = await verifyAttestationWithMeta(attestationToken, oculusAccessToken);
 
       if (!payload) {
         attestation.reason = "verification_failed";
         console.warn(`[ATTESTATION] Meta verification failed for user: ${metaId}`);
       } else {
-        attestation.app_integrity = payload?.app_state?.app_integrity_state || "unknown";
-        attestation.device_integrity = payload?.device_state?.device_integrity_state || "unknown";
-        attestation.unique_id = payload?.device_state?.unique_id || null;
-        attestation.device_ban = payload?.device_state?.device_ban || null;
-        attestation.cert_check = validateCertificate(payload?.app_state?.cert_hashes);
+        const rawApp = payload.app_state?.app_integrity_state || "unknown";
+        const rawDevice = payload.device_state?.device_integrity_state || "unknown";
 
-        // Warn on unknown integrity states (helps catch Meta API changes)
-        const rawApp = payload?.app_state?.app_integrity_state;
-        const rawDevice = payload?.device_state?.device_integrity_state;
-        if (rawApp && !KNOWN_APP_STATES.includes(rawApp) || rawDevice && !KNOWN_DEVICE_STATES.includes(rawDevice)) {
+        attestation.app_integrity = rawApp;
+        attestation.device_integrity = rawDevice;
+        attestation.unique_id = payload.device_state?.unique_id || null;
+        attestation.device_ban = payload.device_ban || null;
+
+        // Certificate validation
+        attestation.cert_check = validateCertificate(payload.app_state?.package_cert_sha256_digest);
+
+        if (!KNOWN_APP_STATES.includes(rawApp) || !KNOWN_DEVICE_STATES.includes(rawDevice)) {
           console.warn(`[ATTESTATION] UNKNOWN INTEGRITY STATE → App:${rawApp} Device:${rawDevice} MetaId:${metaId}`);
         }
 
-        // Handle device already banned by Meta
-        if (attestation.device_ban?.is_banned) {
+        // Meta device ban check (early exit)
+        if (attestation.device_ban?.is_banned === true) {
           console.warn(`[META DEVICE BANNED] User:${metaId} | UniqueId:${attestation.unique_id || 'unknown'} | RemainingTime:${attestation.device_ban?.remaining_ban_time || 'unknown'}`);
-
-          // Look up existing account to get PlayFabId and check for attestation auto-unban
-          const playFabId = await getPlayFabIdFromCustomId(metaId, titleId, secretKey);
           
-          if (playFabId) {
-            // Load blob to check for auto-unban eligibility
-            const existingBlob = await loadSecurityBlob(titleId, secretKey, playFabId);
-            
-            if (existingBlob) {
-              // ============================================================
-              // TEMPORARY: Auto-unban device attestation false positives
-              // (January 2026) - device_NotTrusted/device_Basic only bans
-              // ============================================================
-              const attestBan = detectAttestationBanForUnban(existingBlob);
+          // Get PlayFab ID (needed for ban reason lookup)
+          const playFabId = await getPlayFabIdFromCustomId(metaId, titleId, secretKey);
+
+          // ============================================================
+          // TEMPORARY: Auto-unban device attestation false positives
+          // (January 2026) - device_NotTrusted/device_Basic only bans
+          // ============================================================
+          let attestationUnbanned = false;
+          if (playFabId && ATTESTATION_UNBAN.enabled) {
+            const blob = await loadSecurityBlob(titleId, secretKey, playFabId);
+            if (blob) {
+              const attestBan = detectAttestationBanForUnban(blob);
               if (attestBan) {
                 console.log(`[ATTESTATION-UNBAN] Detected eligible ban for MetaId:${metaId} PlayFabId:${playFabId} Reason:${attestBan.reason}`);
                 
                 const unbanResult = await remediateAttestationBan(
-                  attestation.unique_id,  // Has active Meta ban
+                  attestation.unique_id,  // Fresh unique_id from current attestation
                   playFabId, 
                   oculusAccessToken, 
                   titleId, 
@@ -1285,31 +1010,39 @@ export default async function handler(req, res) {
                   console.log(`[ATTESTATION-UNBAN] Current device state: App:${attestation.app_integrity} Device:${attestation.device_integrity} MetaId:${metaId}`);
                   
                   // Record unban in blob and save
-                  recordAttestationUnban(existingBlob, attestBan, unbanResult);
-                  await saveSecurityBlob(titleId, secretKey, playFabId, existingBlob);
+                  recordAttestationUnban(blob, attestBan, unbanResult);
+                  await saveSecurityBlob(titleId, secretKey, playFabId, blob);
                   
-                  // Update in-memory attestation state so downstream code doesn't re-ban
-                  attestation.device_ban.is_banned = false;
+                  // Mark as unbanned so we skip the banned response and continue login
                   attestationUnbanned = true;
-                  
-                  // Don't return here - let the user continue to login
+                  // Update in-memory state so downstream code doesn't re-ban
+                  attestation.device_ban.is_banned = false;
                 } else {
                   console.error(`[ATTESTATION-UNBAN] Failed to unban MetaId:${metaId}: ${unbanResult.error}`);
+                  // Fall through to normal banned response
                 }
               }
-              // ============================================================
-
-              // If still banned (not auto-unbanned), sync blob info
-              if (attestation.device_ban?.is_banned && existingBlob.mb) {
-                // Sync UniqueId if missing
-                if (!existingBlob.mb.uid && attestation.unique_id) {
-                  existingBlob.mb.uid = attestation.unique_id;
-                  existingBlob.lua = new Date().toISOString();
-                  await saveSecurityBlob(titleId, secretKey, playFabId, existingBlob);
-                }
+            }
+          }
+          // ============================================================
+          // END TEMPORARY ATTESTATION AUTO-UNBAN
+          // ============================================================
+          
+          // If we just unbanned them, skip the banned response and continue login
+          if (!attestationUnbanned) {
+            // Check Security blob status and handle registry backfill / alt account detection
+            if (playFabId && attestation.unique_id) {
+              const existingBlob = await loadSecurityBlob(titleId, secretKey, playFabId);
+              const hasBanEvidence = existingBlob?.mb?.r;
+              
+              if (hasBanEvidence) {
+                // This account has ban evidence - it's the original banned account (or already linked)
+                // Check if we need to backfill the registry
+                const existingRegistry = await lookupDeviceBan(titleId, secretKey, attestation.unique_id);
                 
-                // Ensure this device is in the registry
-                if (attestation.unique_id) {
+                if (!existingRegistry) {
+                  // Backfill: add this account to the registry
+                  console.log(`[DEVICE BAN REGISTRY] Backfilling from existing ban: PlayFabId:${playFabId} Reason:${existingBlob.mb.r}`);
                   await registerDeviceBan(
                     titleId, 
                     secretKey, 
@@ -1319,24 +1052,21 @@ export default async function handler(req, res) {
                     existingBlob.mb.r
                   );
                 }
-              }
-            } else {
-              // No ban evidence on this account - check if this is an alt account
-              const originalBan = await lookupDeviceBan(titleId, secretKey, attestation.unique_id);
-              
-              if (originalBan) {
-                // Found the original banned account - copy their Security blob to this alt
-                console.log(`[DEVICE BAN REGISTRY] Alt account detected: MetaId:${metaId} PlayFabId:${playFabId} | Original: PlayFabId:${originalBan.playFabId}`);
-                await createLinkedBanBlob(titleId, secretKey, playFabId, originalBan.playFabId);
               } else {
-                // Not in registry - could be legacy ban or rotated UniqueId
-                console.log(`[DEVICE BAN REGISTRY] No registry entry for UniqueId:${attestation.unique_id.slice(0, 16)}... | MetaId:${metaId} (legacy ban or rotated ID)`);
+                // No ban evidence on this account - check if this is an alt account
+                const originalBan = await lookupDeviceBan(titleId, secretKey, attestation.unique_id);
+                
+                if (originalBan) {
+                  // Found the original banned account - copy their Security blob to this alt
+                  console.log(`[DEVICE BAN REGISTRY] Alt account detected: MetaId:${metaId} PlayFabId:${playFabId} | Original: PlayFabId:${originalBan.playFabId}`);
+                  await createLinkedBanBlob(titleId, secretKey, playFabId, originalBan.playFabId);
+                } else {
+                  // Not in registry - could be legacy ban or rotated UniqueId
+                  console.log(`[DEVICE BAN REGISTRY] No registry entry for UniqueId:${attestation.unique_id.slice(0, 16)}... | MetaId:${metaId} (legacy ban or rotated ID)`);
+                }
               }
             }
-          }
-          
-          // If still banned after potential auto-unban, return ban response
-          if (attestation.device_ban?.is_banned) {
+            
             // Look up actual ban reason from PlayFab
             let banReason = "Device ban"; // Default for device-banned users with no PlayFab account
             if (playFabId) {
@@ -1496,7 +1226,6 @@ export default async function handler(req, res) {
         // ============================================================
 
         // Only issue Meta device ban if not already banned
-        // Circuit breaker is checked inside banDevice()
         if (attestation.unique_id && masterPlayFabId && !attestation.device_ban?.is_banned) {
           const metaBan = await banDeviceAndRecord(attestation.unique_id, oculusAccessToken, banInfo.durationMinutes, {
             titleId,
@@ -1522,30 +1251,58 @@ export default async function handler(req, res) {
         });
       }
 
-      console.error("[PLAYFAB LOGIN ERROR]", playfabData);
-      return res.status(playfabResp.status).json({ success: false, error: playfabData.errorMessage || "Authentication failed" });
+      // Non-ban error
+      return res.status(400).json({
+        success: false,
+        error: "AuthenticationFailed",
+        errorMessage: playfabData.errorMessage || "Unable to authenticate. Please try again."
+      });
     }
 
     const masterPlayFabId = playfabData.data.PlayFabId;
 
-    // Helper to load security blob once
+    // === SECURITY BLOB (load once, save once at end) ===
+    let securityBlob; // undefined = not loaded yet
+    let securityDirty = false;
+
     async function ensureBlob() {
-      if (!securityBlob) {
-        securityBlob = await loadSecurityBlob(titleId, secretKey, masterPlayFabId);
+      // If we already tried and failed, don't keep retrying in this request
+      if (securityBlob === null) return null;
+
+      // First attempt
+      if (securityBlob === undefined) {
+        const loaded = await loadSecurityBlob(titleId, secretKey, masterPlayFabId);
+        securityBlob = loaded || null; // null marks a failed load
       }
-      return securityBlob;
+
+      return securityBlob; // either object or null
     }
 
-    // Helper to check if current user is a developer (bypasses attestation enforcement)
-    async function checkIsDev() {
-      return isDeveloper(masterPlayFabId, titleId, secretKey);
-    }
+    // === ENFORCEMENT ===
+    if (ENFORCEMENT_CONFIG.enabled) {
+      let _isDev;
+      const checkIsDev = async () => {
+        if (_isDev === undefined) {
+          _isDev = await isDeveloper(masterPlayFabId, titleId, secretKey);
+        }
+        return _isDev;
+      };
 
-    // === Attestation Enforcement ===
-    if (attestationToken) {
-      // Dev accounts bypass attestation
-      if (!attestation.valid && attestation.reason === "no_token" && (await checkIsDev())) {
-        console.log(`[DEV BYPASS] Allowing missing attestation token for developer: ${metaId}`);
+      // Handle missing attestation token
+      if (!attestationToken) {
+        const noTokenAction = getEnforcementAction("no_token");
+        if (noTokenAction !== "allow") {
+          if (await checkIsDev()) {
+            console.log(`[DEV BYPASS] Allowing missing attestation token for developer: ${metaId}`);
+          } else {
+            console.warn(`[ATTESTATION BLOCKED] No token | MetaId:${metaId} | Action:${noTokenAction}`);
+            return res.status(403).json({
+              success: false,
+              error: "AuthenticationFailed",
+              errorMessage: "Unable to authenticate. Please try again."
+            });
+          }
+        }
       }
 
       // Handle verification failures (Meta API couldn't verify)
@@ -1586,7 +1343,6 @@ export default async function handler(req, res) {
             }
 
             // Meta permanent hardware ban (only if not already banned)
-            // Circuit breaker is checked inside banDevice()
             if (attestation.unique_id && !attestation.device_ban?.is_banned) {
               const metaBan = await banDeviceAndRecord(attestation.unique_id, oculusAccessToken, 52560000, {
                 titleId,
