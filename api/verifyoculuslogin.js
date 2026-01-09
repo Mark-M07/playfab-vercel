@@ -2,6 +2,7 @@
 import fetch from 'node-fetch';
 import querystring from 'node:querystring';
 import crypto from 'crypto';
+import dns from 'node:dns/promises';
 
 // === CONFIGURATION ===
 const KNOWN_APP_STATES = ["NotRecognized", "NotEvaluated", "StoreRecognized"];
@@ -51,6 +52,134 @@ const ENFORCEMENT_CONFIG = {
   // No attestation token provided
   no_token: "block",            // Modified client
 };
+
+// ============================================================================
+// SECURITY: DNS VERIFICATION
+// Protection against DNS hijacking / BGP attacks / MITM on outbound requests
+// ============================================================================
+
+// PlayFab static IP ranges
+const PLAYFAB_VALID_IP_RANGES = [
+  { start: '20.120.128.144', end: '20.120.128.159' },
+  { start: '20.120.129.32', end: '20.120.129.47' },
+  { start: '20.120.129.96', end: '20.120.129.111' },
+  { start: '20.120.129.160', end: '20.120.129.175' },
+  { start: '20.120.129.240', end: '20.120.129.255' },
+  { start: '20.120.130.208', end: '20.120.130.223' },
+  { start: '20.120.131.0', end: '20.120.131.15' },
+  { start: '20.120.131.240', end: '20.120.131.255' },
+  { start: '20.120.132.32', end: '20.120.132.47' },
+  { start: '20.120.132.208', end: '20.120.132.223' },
+  { start: '20.120.133.64', end: '20.120.133.79' },
+  { start: '20.120.133.112', end: '20.120.133.127' },
+  { start: '20.252.116.240', end: '20.252.116.255' },
+  { start: '20.252.117.240', end: '20.252.117.255' },
+  { start: '20.252.118.0', end: '20.252.118.15' },
+  { start: '20.252.118.48', end: '20.252.118.63' },
+  { start: '20.252.118.64', end: '20.252.118.79' },
+  { start: '20.252.118.208', end: '20.252.118.223' },
+  { start: '20.252.119.16', end: '20.252.119.31' },
+  { start: '20.252.119.176', end: '20.252.119.191' },
+  { start: '20.252.119.192', end: '20.252.119.207' },
+  { start: '20.252.119.240', end: '20.252.119.255' },
+  { start: '20.252.119.48', end: '20.252.119.63' },
+  { start: '20.252.119.96', end: '20.252.119.111' },
+  { start: '20.51.84.128', end: '20.51.84.143' },
+  { start: '20.51.84.160', end: '20.51.84.175' },
+  { start: '20.51.84.176', end: '20.51.84.191' },
+  { start: '20.51.84.240', end: '20.51.84.255' },
+  { start: '20.51.85.32', end: '20.51.85.47' },
+  { start: '20.51.85.64', end: '20.51.85.79' },
+  { start: '20.51.85.128', end: '20.51.85.143' },
+  { start: '20.51.85.176', end: '20.51.85.191' },
+  { start: '20.72.226.112', end: '20.72.226.127' },
+  { start: '20.72.226.160', end: '20.72.226.175' },
+  { start: '52.250.84.16', end: '52.250.84.31' },
+  { start: '52.250.87.96', end: '52.250.87.111' },
+  { start: '52.250.87.160', end: '52.250.87.175' },
+  { start: '52.250.87.192', end: '52.250.87.207' },
+  { start: '48.210.5.64', end: '48.210.5.127' },   
+  { start: '48.210.5.128', end: '48.210.5.191' },  
+  { start: '48.210.6.0', end: '48.210.7.255' },    
+  { start: '20.9.200.0', end: '20.9.200.127' },
+  { start: '20.9.200.128', end: '20.9.200.255' },
+  { start: '20.42.182.0', end: '20.42.183.255' },
+  { start: '34.213.208.16', end: '34.213.208.16' },
+  { start: '34.216.170.167', end: '34.216.170.167' },
+  { start: '52.13.201.178', end: '52.13.201.178' },
+  { start: '57.154.81.226', end: '57.154.81.227' }, 
+];
+
+// DNS verification config
+const DNS_CONFIG = {
+  maxRetries: 3,           
+  retryDelayMs: 100,       
+  cacheFailuresFor: 30000, 
+};
+
+// Track DNS failure state
+let dnsFailureState = {
+  lastFailure: null,
+  consecutiveFailures: 0,
+};
+
+function ipToNumber(ip) {
+  const parts = ip.split('.').map(Number);
+  return ((parts[0] << 24) >>> 0) + (parts[1] << 16) + (parts[2] << 8) + parts[3];
+}
+
+function isValidPlayFabIP(ip) {
+  const ipNum = ipToNumber(ip);
+  for (const range of PLAYFAB_VALID_IP_RANGES) {
+    const startNum = ipToNumber(range.start);
+    const endNum = ipToNumber(range.end);
+    if (ipNum >= startNum && ipNum <= endNum) {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function verifyPlayFabDNS(titleId) {
+  const hostname = `${titleId}.playfabapi.com`;
+  
+  if (dnsFailureState.lastFailure) {
+    const elapsed = Date.now() - dnsFailureState.lastFailure;
+    if (elapsed < DNS_CONFIG.cacheFailuresFor && dnsFailureState.consecutiveFailures >= 3) {
+      console.warn(`[SECURITY DNS] Skipping check - in failure cooldown (${Math.round(elapsed/1000)}s ago)`);
+      return { valid: false, ips: [], invalidIps: [], cached: true };
+    }
+  }
+  
+  for (let attempt = 1; attempt <= DNS_CONFIG.maxRetries; attempt++) {
+    try {
+      const ips = await dns.resolve4(hostname);
+      const invalidIps = ips.filter(ip => !isValidPlayFabIP(ip));
+      
+      if (invalidIps.length === 0) {
+        dnsFailureState.lastFailure = null;
+        dnsFailureState.consecutiveFailures = 0;
+        return { valid: true, ips, invalidIps: [], attempt };
+      }
+      
+      console.error(`[SECURITY DNS ATTACK] ⚠️ ALERT: DNS hijacking detected! Attempt ${attempt}/${DNS_CONFIG.maxRetries}`);
+      
+      if (attempt < DNS_CONFIG.maxRetries) {
+        await new Promise(r => setTimeout(r, DNS_CONFIG.retryDelayMs));
+      }
+      
+    } catch (e) {
+      console.warn(`[SECURITY DNS] Resolution failed for ${hostname} (attempt ${attempt}): ${e.message}`);
+      if (attempt < DNS_CONFIG.maxRetries) {
+        await new Promise(r => setTimeout(r, DNS_CONFIG.retryDelayMs));
+      }
+    }
+  }
+  
+  dnsFailureState.lastFailure = Date.now();
+  dnsFailureState.consecutiveFailures++;
+  return { valid: false, ips: [], invalidIps: [], exhausted: true };
+}
 
 // ============================================================================
 // TEMPORARY: DEVICE ATTESTATION AUTO-UNBAN (January 2026)
@@ -852,6 +981,21 @@ export default async function handler(req, res) {
   if (!titleId || !secretKey || !appId || !appSecret) {
     return res.status(500).json({ success: false, error: 'Server misconfigured' });
   }
+
+  // ============================================================================
+  // SECURITY: Verify PlayFab DNS
+  // ============================================================================
+  const dnsCheck = await verifyPlayFabDNS(titleId);
+  if (!dnsCheck.valid) {
+    if (dnsCheck.cached) console.warn(`[SECURITY] Login blocked - DNS in failure cooldown`);
+    else console.error(`[SECURITY] Login blocked - DNS verification failed after ${DNS_CONFIG.maxRetries} attempts`);
+    return res.status(503).json({ 
+      success: false, 
+      error: "Service temporarily unavailable",
+      errorMessage: "Unable to connect. Please try again."
+    });
+  }
+  // ============================================================================
 
   if (req.method === "GET" || req.method === "HEAD") {
     return res.status(204).end();
