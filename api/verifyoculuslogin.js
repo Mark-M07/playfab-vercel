@@ -1065,24 +1065,65 @@ export default async function handler(req, res) {
 
     if (!playfabResp.ok) {
       if (playfabData.errorCode === 1002) {
-        // User is banned - extract ban info from PlayFab response
+        // LoginWithCustomID claims user is banned.
+        // MITM DEFENSE: Cross-verify with independent GetUserBans call before
+        // issuing any irreversible Meta device ban. Attacker has previously
+        // injected fake 1002 responses to weaponise our own ban cascade.
         const banInfo = extractBanInfo(playfabData);
-        console.warn(`[BANNED USER LOGIN] MetaId:${metaId} | Reason:${banInfo.reason} | Expiry:${banInfo.expiry}`);
-
         const masterPlayFabId = await getPlayFabIdFromCustomId(metaId, titleId, secretKey);
 
-        // Only issue Meta device ban if not already banned
+        // === CROSS-VERIFY: Confirm ban is real ===
+        let confirmedBan = false;
+        let verifiedReason = banInfo.reason;
+        let verifiedExpiry = banInfo.expiry;
+
+        if (masterPlayFabId) {
+          try {
+            const confirmResp = await fetch(`https://${titleId}.playfabapi.com/Server/GetUserBans`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'X-SecretKey': secretKey },
+              body: JSON.stringify({ PlayFabId: masterPlayFabId })
+            });
+
+            if (confirmResp.ok) {
+              const bansData = await confirmResp.json();
+              const activeBan = bansData?.data?.BanData?.find(b => b.Active);
+              if (activeBan) {
+                confirmedBan = true;
+                verifiedReason = activeBan.Reason || banInfo.reason;
+                verifiedExpiry = activeBan.Expires || banInfo.expiry;
+              }
+            }
+          } catch (e) {
+            console.error(`[BAN VERIFY] GetUserBans failed for MetaId:${metaId} — ${e.message}`);
+          }
+        }
+
+        if (!confirmedBan) {
+          // LoginWithCustomID said banned, but GetUserBans disagrees — MITM detected
+          console.error(`[MITM DEFENSE] Fake ban intercepted! MetaId:${metaId} | PlayFabId:${masterPlayFabId || 'unresolved'} | FakeReason:${banInfo.reason} | FakeExpiry:${banInfo.expiry}`);
+          // Return 503 so client retries (next attempt routes through clean path)
+          return res.status(503).json({
+            success: false,
+            error: "Service temporarily unavailable",
+            errorMessage: "Unable to connect. Please try again."
+          });
+        }
+
+        // Ban confirmed real — proceed with Meta device ban
+        console.warn(`[BANNED USER LOGIN] MetaId:${metaId} | Reason:${verifiedReason} | Expiry:${verifiedExpiry} | Verified:true`);
+
         if (attestation.unique_id && masterPlayFabId && !attestation.device_ban?.is_banned) {
           const metaBan = await banDeviceAndRecord(attestation.unique_id, oculusAccessToken, banInfo.durationMinutes, {
             titleId,
             secretKey,
             playFabId: masterPlayFabId,
-            banReason: `PlayFab ban: ${banInfo.reason}`,
+            banReason: `PlayFab ban: ${verifiedReason}`,
             metaId
           });
           // Register in device ban registry for cross-account lookups
           if (metaBan.success) {
-            await registerDeviceBan(titleId, secretKey, attestation.unique_id, masterPlayFabId, metaId, `PlayFab ban: ${banInfo.reason}`);
+            await registerDeviceBan(titleId, secretKey, attestation.unique_id, masterPlayFabId, metaId, `PlayFab ban: ${verifiedReason}`);
           }
         } else if (!masterPlayFabId) {
           console.error(`[CRITICAL] Failed to resolve MasterPlayFabId for banned MetaId:${metaId} — Meta ban NOT stored!`);
@@ -1093,7 +1134,7 @@ export default async function handler(req, res) {
           error: "AccountBanned",
           errorCode: 1002,
           errorMessage: "Account is banned.",
-          banInfo: { reason: banInfo.reason, expiry: banInfo.expiry }
+          banInfo: { reason: verifiedReason, expiry: verifiedExpiry }
         });
       }
 
