@@ -19,6 +19,14 @@ const VALID_CERT_HASH = (process.env.VALID_CERT_HASH || "").trim().toLowerCase()
 // Token freshness threshold in seconds
 const TOKEN_FRESHNESS_THRESHOLD = 300;
 
+// === VERSION GATE ===
+// Minimum allowed bundleVersionCode (integer from Meta attestation payload).
+// Set via env var. 0 or empty = disabled. When you ship a new build and want
+// to cut off old versions, update this to the oldest versionCode you still allow.
+// The value comes from Meta's signed attestation claims (app_state.version),
+// so it cannot be spoofed by the client.
+const MINIMUM_VERSION_CODE = parseInt(process.env.MINIMUM_VERSION_CODE || "0", 10) || 0;
+
 // === ENFORCEMENT CONFIGURATION ===
 // Action types: "allow" | "block" | "ban"
 //   - allow: Let login proceed (monitoring only)
@@ -51,6 +59,9 @@ const ENFORCEMENT_CONFIG = {
   
   // No attestation token provided
   no_token: "block",            // Modified client
+
+  // Game version too old (Meta-attested versionCode below minimum)
+  version_outdated: "block",    // Block login, prompt update — never ban (could be legit stale install)
 };
 
 // ============================================================================
@@ -192,6 +203,7 @@ const FLAGS = {
   DEVICE_BASIC:        1 << 6,  // 64
   CERT_MISMATCH:       1 << 7,  // 128
   CERT_MISSING:        1 << 8,  // 256
+  VERSION_OUTDATED:    1 << 9,  // 512
 };
 
 // === HELPERS ===
@@ -934,7 +946,6 @@ export default async function handler(req, res) {
         attestation.reason = "verification_failed";
         console.warn(`[ATTESTATION] Meta verification failed for user: ${metaId}`);
       } else {
-        console.log(`[ATTESTATION PAYLOAD] MetaId:${metaId} | Raw:`, JSON.stringify(payload));
         const rawApp = payload.app_state?.app_integrity_state || "unknown";
         const rawDevice = payload.device_state?.device_integrity_state || "unknown";
 
@@ -1203,6 +1214,30 @@ export default async function handler(req, res) {
             error: "AuthenticationFailed",
             errorMessage: "Unable to authenticate. Please try again."
           });
+        }
+      }
+
+      // === VERSION GATE ===
+      // Uses Meta-attested versionCode from the signed payload — cannot be spoofed.
+      // Only applies when we have a valid attestation payload (payload != null)
+      // and MINIMUM_VERSION_CODE is configured.
+      if (MINIMUM_VERSION_CODE > 0 && payload?.app_state?.version) {
+        const clientVersionCode = parseInt(payload.app_state.version, 10) || 0;
+
+        if (clientVersionCode < MINIMUM_VERSION_CODE) {
+          const versionAction = getEnforcementAction("version_outdated");
+          if (versionAction !== "allow") {
+            if (await checkIsDev()) {
+              console.log(`[DEV BYPASS] Allowing outdated version for developer: ${metaId} | VersionCode:${clientVersionCode} | Min:${MINIMUM_VERSION_CODE}`);
+            } else {
+              console.warn(`[VERSION BLOCKED] PlayFabId:${masterPlayFabId} | MetaId:${metaId} | VersionCode:${clientVersionCode} | Min:${MINIMUM_VERSION_CODE} | Action:${versionAction}`);
+              return res.status(403).json({
+                success: false,
+                error: "AuthenticationFailed",
+                errorMessage: "Unable to authenticate. Please try again."
+              });
+            }
+          }
         }
       }
 
