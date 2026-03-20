@@ -934,6 +934,7 @@ export default async function handler(req, res) {
         attestation.reason = "verification_failed";
         console.warn(`[ATTESTATION] Meta verification failed for user: ${metaId}`);
       } else {
+        console.log(`[ATTESTATION PAYLOAD] MetaId:${metaId} | Raw:`, JSON.stringify(payload));
         const rawApp = payload.app_state?.app_integrity_state || "unknown";
         const rawDevice = payload.device_state?.device_integrity_state || "unknown";
 
