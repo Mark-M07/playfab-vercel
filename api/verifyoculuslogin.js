@@ -384,11 +384,17 @@ function worstState(current, candidate, order) {
 // === SECURITY BLOB HELPERS ===
 
 async function loadSecurityBlob(titleId, secretKey, playFabId) {
-  const resp = await fetch(`https://${titleId}.playfabapi.com/Server/GetUserInternalData`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-SecretKey': secretKey },
-    body: JSON.stringify({ PlayFabId: playFabId, Keys: ["Security"] })
-  });
+  let resp;
+  try {
+    resp = await fetch(`https://${titleId}.playfabapi.com/Server/GetUserInternalData`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-SecretKey': secretKey },
+      body: JSON.stringify({ PlayFabId: playFabId, Keys: ["Security"] })
+    });
+  } catch (e) {
+    console.error(`[LOAD SECURITY] Network error for PlayFabId:${playFabId}: ${e.code || e.message}`);
+    return null;
+  }
 
   if (!resp.ok) {
     const text = await resp.text().catch(() => "");
@@ -802,8 +808,9 @@ async function isDeveloper(playFabId, titleId, secretKey) {
       if (!data) return false;
       return data.data?.Data?.IsDeveloper?.Value === "true";
     }
+    console.error(`[isDeveloper] HTTP ${resp.status} for PlayFabId:${playFabId}`);
   } catch (e) {
-    console.error('[isDeveloper failed]', e);
+    console.error(`[isDeveloper] Network error for PlayFabId:${playFabId}: ${e.code || e.message}`);
   }
   return false;
 }
@@ -1054,23 +1061,44 @@ export default async function handler(req, res) {
     }
 
     // === PlayFab Login ===
-    const playfabResp = await fetch(`https://${titleId}.playfabapi.com/Server/LoginWithCustomID`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-SecretKey': secretKey },
-      body: JSON.stringify({
-        CustomId: metaId,
-        CreateAccount: true,
-        InfoRequestParameters: {
-          GetUserAccountInfo: true,
-          GetPlayerProfile: true,
-          GetUserData: true,
-          GetEntityToken: true,
-          ProfileConstraints: { ShowDisplayName: true }
-        }
-      })
+    const playfabLoginBody = JSON.stringify({
+      CustomId: metaId,
+      CreateAccount: true,
+      InfoRequestParameters: {
+        GetUserAccountInfo: true,
+        GetPlayerProfile: true,
+        GetUserData: true,
+        GetEntityToken: true,
+        ProfileConstraints: { ShowDisplayName: true }
+      }
     });
 
-    const playfabData = await readJson(playfabResp, "PLAYFAB LOGIN");
+    let playfabResp;
+    let playfabData;
+    const maxLoginRetries = 2;
+    for (let attempt = 1; attempt <= maxLoginRetries; attempt++) {
+      try {
+        playfabResp = await fetch(`https://${titleId}.playfabapi.com/Server/LoginWithCustomID`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-SecretKey': secretKey },
+          body: playfabLoginBody
+        });
+        break; // success — exit retry loop
+      } catch (e) {
+        console.error(`[PLAYFAB LOGIN] Network error (attempt ${attempt}/${maxLoginRetries}): ${e.code || e.message} | MetaId:${metaId}`);
+        if (attempt < maxLoginRetries) {
+          await new Promise(r => setTimeout(r, 500));
+        } else {
+          return res.status(503).json({
+            success: false,
+            error: "Service temporarily unavailable",
+            errorMessage: "Unable to connect. Please try again."
+          });
+        }
+      }
+    }
+
+    playfabData = await readJson(playfabResp, "PLAYFAB LOGIN");
     if (!playfabData) {
       return res.status(503).json({ success: false, error: "Service temporarily unavailable" });
     }
@@ -1194,7 +1222,33 @@ export default async function handler(req, res) {
           if (await checkIsDev()) {
             console.log(`[DEV BYPASS] Allowing missing attestation token for developer: ${metaId}`);
           } else {
-            console.warn(`[ATTESTATION BLOCKED] No token | MetaId:${metaId} | Action:${noTokenAction}`);
+            console.warn(`[ATTESTATION BLOCKED] No token | PlayFabId:${masterPlayFabId} | MetaId:${metaId} | Action:${noTokenAction}`);
+
+            // Record no-token attempt in security blob
+            try {
+              const blob = await ensureBlob();
+              if (blob) {
+                const now = new Date().toISOString();
+                const di = blob.di || (blob.di = {});
+                di.ntc = (di.ntc || 0) + 1;          // no-token count
+                if (!di.ntf) di.ntf = now;           // first no-token time
+                di.ntl = now;                        // last no-token time
+                blob.lua = now;
+                securityDirty = true;
+              }
+            } catch (e) {
+              console.error(`[ATTESTATION BLOCKED] Failed to update security blob for PlayFabId:${masterPlayFabId}: ${e.message}`);
+            }
+
+            // Save blob before returning
+            if (securityDirty && securityBlob) {
+              try {
+                await saveSecurityBlob(titleId, secretKey, masterPlayFabId, securityBlob);
+              } catch (e) {
+                console.error("[SECURITY BLOB SAVE FAILED]", e);
+              }
+            }
+
             return res.status(403).json({
               success: false,
               error: "AuthenticationFailed",
@@ -1230,7 +1284,34 @@ export default async function handler(req, res) {
             if (await checkIsDev()) {
               console.log(`[DEV BYPASS] Allowing outdated version for developer: ${metaId} | VersionCode:${clientVersionCode} | Min:${MINIMUM_VERSION_CODE}`);
             } else {
-              console.warn(`[VERSION BLOCKED] PlayFabId:${masterPlayFabId} | MetaId:${metaId} | VersionCode:${clientVersionCode} | Min:${MINIMUM_VERSION_CODE} | Action:${versionAction}`);
+              console.warn(`[VERSION BLOCKED] PlayFabId:${masterPlayFabId} | MetaId:${metaId} | VersionCode:${clientVersionCode} | Min:${MINIMUM_VERSION_CODE} | App:${attestation.app_integrity} | Device:${attestation.device_integrity} | Action:${versionAction}`);
+
+              // Record version-block attempt in security blob
+              try {
+                const blob = await ensureBlob();
+                if (blob) {
+                  const now = new Date().toISOString();
+                  const di = blob.di || (blob.di = {});
+                  di.vbc = (di.vbc || 0) + 1;          // version-block count
+                  if (!di.vbf) di.vbf = now;           // first version-block time
+                  di.vbl = now;                        // last version-block time
+                  di.vbv = clientVersionCode;          // last blocked versionCode
+                  blob.lua = now;
+                  securityDirty = true;
+                }
+              } catch (e) {
+                console.error(`[VERSION BLOCKED] Failed to update security blob for PlayFabId:${masterPlayFabId}: ${e.message}`);
+              }
+
+              // Save blob before returning
+              if (securityDirty && securityBlob) {
+                try {
+                  await saveSecurityBlob(titleId, secretKey, masterPlayFabId, securityBlob);
+                } catch (e) {
+                  console.error("[SECURITY BLOB SAVE FAILED]", e);
+                }
+              }
+
               return res.status(403).json({
                 success: false,
                 error: "AuthenticationFailed",
