@@ -14,7 +14,8 @@ const EXPECTED_PACKAGE_ID = process.env.EXPECTED_PACKAGE_ID || "com.ContinuumXR.
 
 // APK Certificate Validation Config
 // SHA256 hash of release signing certificate (lowercase, no colons)
-// Leave empty to monitor without validation (will log all cert hashes)
+// Leave empty to disable enforcement and log the presented client cert hash
+// when available during attestation processing.
 const VALID_CERT_HASH = (process.env.VALID_CERT_HASH || "").trim().toLowerCase();
 
 // Token freshness threshold in seconds
@@ -316,9 +317,9 @@ let _activeTitleId = null;
  * Routes the connection through DoH-resolved, IP-validated endpoints
  * so that local DNS poisoning has zero effect on outbound traffic.
  *
+ * IMPORTANT: _activeTitleId must be set by the handler before calling pfFetch.
  * Usage: replace `fetch(\`https://${titleId}.playfabapi.com/...\`, opts)`
  *   with `pfFetch(\`https://${titleId}.playfabapi.com/...\`, opts)`
- * No other changes needed — the titleId is read from module state.
  */
 function pfFetch(url, options = {}) {
   return fetch(url, { ...options, agent: getPinnedAgent(_activeTitleId) });
@@ -389,9 +390,13 @@ function getEnforcementAction(failReasons) {
     
     const reasonAction = ENFORCEMENT_CONFIG[configKey];
     
-    // Warn on unknown config keys (typos, new Meta states, etc.)
+    // Unknown config keys default to "block" (fail-safe).
+    // If Meta introduces a new integrity state we haven't mapped, we block
+    // rather than silently allowing — gives us time to evaluate and update config.
     if (reasonAction === undefined) {
-      console.warn(`[ENFORCEMENT] Unknown reason key: ${configKey} — defaulting to allow`);
+      console.warn(`[ENFORCEMENT] Unknown reason key: ${configKey} — defaulting to block (fail-safe)`);
+      if (action !== "ban") action = "block";
+      continue;
     }
     
     // Escalate: ban > block > allow
@@ -428,30 +433,36 @@ async function readJson(resp, label, { maxLog = 400 } = {}) {
 
 /**
  * Validates the APK signing certificate hash against the expected hash.
+ * When VALID_CERT_HASH is not configured, returns { checked: false, valid: true }
+ * so callers never see a "failed" result that is intentionally non-enforced.
  */
 function validateCertificate(certHashes) {
-  const result = { valid: true, reason: "ok", clientHash: null };
+  // Extract client hash opportunistically (for logging even when not enforcing)
+  const clientHash = (Array.isArray(certHashes) && certHashes.length > 0)
+    ? String(certHashes[0] || "").toLowerCase()
+    : null;
 
-  if (!certHashes || !Array.isArray(certHashes) || certHashes.length === 0) {
-    result.valid = false;
-    result.reason = "no_cert_in_payload";
-    return result;
-  }
-
-  result.clientHash = String(certHashes[0] || "").toLowerCase();
-
+  // If no expected hash is configured, cert validation is disabled — not a failure
   if (!VALID_CERT_HASH) {
-    result.reason = "no_expected_hash_configured";
-    console.log(`[CERT CHECK] No expected hash configured. Client cert: ${result.clientHash}`);
-    return result;
+    if (clientHash) {
+      console.log(`[CERT CHECK] No expected hash configured. Client cert: ${clientHash}`);
+    }
+    return { checked: false, valid: true, reason: "not_configured", clientHash };
   }
 
-  if (result.clientHash !== VALID_CERT_HASH) {
-    result.valid = false;
-    result.reason = "cert_mismatch";
+  // Configured but no cert data in the attestation payload
+  if (!clientHash) {
+    return { checked: true, valid: false, reason: "missing", clientHash: null };
+    // becomes "cert_missing" after prefix in analyzeAttestationPayload → matches ENFORCEMENT_CONFIG key
   }
 
-  return result;
+  // Configured — compare hashes
+  if (clientHash !== VALID_CERT_HASH) {
+    return { checked: true, valid: false, reason: "mismatch", clientHash };
+    // becomes "cert_mismatch" after prefix in analyzeAttestationPayload → matches ENFORCEMENT_CONFIG key
+  }
+
+  return { checked: true, valid: true, reason: "ok", clientHash };
 }
 
 /**
@@ -518,7 +529,7 @@ function analyzeAttestationPayload(payload, nonce, certCheck) {
     reasonMask |= normalisedDeviceState === "Basic" ? FLAGS.DEVICE_BASIC : FLAGS.DEVICE_NOT_TRUSTED;
   }
   if (certCheckApplies && !checks.certOk) {
-    reasonMask |= certCheck?.reason === "cert_mismatch" ? FLAGS.CERT_MISMATCH : FLAGS.CERT_MISSING;
+    reasonMask |= certCheck?.reason === "mismatch" ? FLAGS.CERT_MISMATCH : FLAGS.CERT_MISSING;
   }
 
   return {
@@ -1223,7 +1234,7 @@ export default async function handler(req, res) {
           console.warn(`[ATTESTATION FAILED] User:${metaId} | Reasons:${attestation.reason}`);
         }
 
-        if (!attestation.cert_check.valid && attestation.cert_check.reason === "cert_mismatch") {
+        if (!attestation.cert_check.valid && attestation.cert_check.reason === "mismatch") {
           console.warn(`[CERT MISMATCH] User:${metaId} | ClientCert:${attestation.cert_check.clientHash} | Expected:${VALID_CERT_HASH}`);
         }
       }
@@ -1620,7 +1631,7 @@ export default async function handler(req, res) {
 
         if (attestation.unique_id) di.uid = attestation.unique_id;
         if (attestation.cert_check?.clientHash) di.ch = attestation.cert_check.clientHash;
-        if (attestation.cert_check?.reason === "cert_mismatch") {
+        if (attestation.cert_check?.reason === "mismatch") {
           di.cmc = (di.cmc || 0) + 1;
           if (!di.fcm) di.fcm = now;
         }

@@ -2,10 +2,17 @@ import fetch from 'node-fetch';
 import crypto from 'crypto';
 
 /**
- * API Module for automated token rotation
- * Generates and stores a new validation token in PlayFab Title Data (public)
- * Called via Vercel Cron every 1 hour
- * Requires PLAYFAB_TITLE_ID, PLAYFAB_DEV_SECRET_KEY env vars
+ * API Module for automated ValidationToken rotation.
+ * Generates a cryptographically random token and stores it in PlayFab public
+ * TitleData — intentionally public so authenticated clients can read it via
+ * GetTitleData for matchmaking isolation (see Security Architecture §7.2).
+ *
+ * Called via Vercel Cron every 1 hour.
+ * Requires PLAYFAB_TITLE_ID, PLAYFAB_DEV_SECRET_KEY, CRON_SECRET env vars.
+ *
+ * NOTE: This endpoint does NOT use DoH-pinned connections for PlayFab traffic.
+ * DoH pinning is implemented in /api/verifyoculuslogin only.
+ *
  * @route GET /api/rotatetoken
  */
 export default async function handler(req, res) {
@@ -14,6 +21,15 @@ export default async function handler(req, res) {
             return res.status(405).json({ 
                 success: false, 
                 error: 'Method Not Allowed' 
+            });
+        }
+
+        // Verify the request is from Vercel's cron scheduler
+        const cronSecret = process.env.CRON_SECRET;
+        if (cronSecret && req.headers['authorization'] !== `Bearer ${cronSecret}`) {
+            return res.status(401).json({
+                success: false,
+                error: 'Unauthorized'
             });
         }
 
@@ -30,7 +46,8 @@ export default async function handler(req, res) {
         // Generate a new cryptographically secure token
         const newToken = crypto.randomBytes(32).toString('base64');
 
-        // Store the new token in PlayFab Title Data (public, accessible by clients)
+        // Store the new token in PlayFab public TitleData — readable by any client
+        // with a valid SessionTicket (i.e. only Vercel-authenticated clients)
         const updateUrl = `https://${titleId}.playfabapi.com/Admin/SetTitleData`;
         const updateBody = JSON.stringify({
             Key: 'ValidationToken',
@@ -51,8 +68,7 @@ export default async function handler(req, res) {
             console.error('Failed to update validation token:', errorData);
             return res.status(500).json({
                 success: false,
-                error: 'Failed to rotate token',
-                details: errorData
+                error: 'Failed to rotate token'
             });
         }
 
@@ -68,8 +84,7 @@ export default async function handler(req, res) {
         console.error('Error rotating token:', err);
         return res.status(500).json({
             success: false,
-            error: 'Internal Server Error',
-            details: err.message
+            error: 'Internal Server Error'
         });
     }
 }
