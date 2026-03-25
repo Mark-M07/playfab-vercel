@@ -2,7 +2,8 @@
 import fetch from 'node-fetch';
 import querystring from 'node:querystring';
 import crypto from 'crypto';
-import dns from 'node:dns/promises';
+import { lookup as dnsLookupCb } from 'node:dns';
+import https from 'node:https';
 
 // === CONFIGURATION ===
 const KNOWN_APP_STATES = ["NotRecognized", "NotEvaluated", "StoreRecognized"];
@@ -65,131 +66,291 @@ const ENFORCEMENT_CONFIG = {
 };
 
 // ============================================================================
-// SECURITY: DNS VERIFICATION
-// Protection against DNS hijacking / BGP attacks / MITM on outbound requests
+// SECURITY: SECURE PLAYFAB RESOLVER
+// DNS-over-HTTPS resolution with IP range validation and connection pinning.
+//
+// Architecture:
+//   1. Resolve PlayFab hostname via DoH (Cloudflare / Google) — immune to
+//      local DNS poisoning since queries travel over HTTPS.
+//   2. Validate every resolved IP against known PlayFab CIDR ranges — defence
+//      in depth even against a compromised DoH provider.
+//   3. Pin outbound PlayFab connections to validated IPs via a custom
+//      https.Agent — Node's own DNS resolver is never used for PlayFab.
+//
 // ============================================================================
 
-// PlayFab static IP ranges
-const PLAYFAB_VALID_IP_RANGES = [
-  { start: '20.120.128.144', end: '20.120.128.159' },
-  { start: '20.120.129.32', end: '20.120.129.47' },
-  { start: '20.120.129.96', end: '20.120.129.111' },
-  { start: '20.120.129.160', end: '20.120.129.175' },
-  { start: '20.120.129.240', end: '20.120.129.255' },
-  { start: '20.120.130.208', end: '20.120.130.223' },
-  { start: '20.120.131.0', end: '20.120.131.15' },
-  { start: '20.120.131.240', end: '20.120.131.255' },
-  { start: '20.120.132.32', end: '20.120.132.47' },
-  { start: '20.120.132.208', end: '20.120.132.223' },
-  { start: '20.120.133.64', end: '20.120.133.79' },
-  { start: '20.120.133.112', end: '20.120.133.127' },
-  { start: '20.252.116.240', end: '20.252.116.255' },
-  { start: '20.252.117.240', end: '20.252.117.255' },
-  { start: '20.252.118.0', end: '20.252.118.15' },
-  { start: '20.252.118.48', end: '20.252.118.63' },
-  { start: '20.252.118.64', end: '20.252.118.79' },
-  { start: '20.252.118.208', end: '20.252.118.223' },
-  { start: '20.252.119.16', end: '20.252.119.31' },
-  { start: '20.252.119.176', end: '20.252.119.191' },
-  { start: '20.252.119.192', end: '20.252.119.207' },
-  { start: '20.252.119.240', end: '20.252.119.255' },
-  { start: '20.252.119.48', end: '20.252.119.63' },
-  { start: '20.252.119.96', end: '20.252.119.111' },
-  { start: '20.51.84.128', end: '20.51.84.143' },
-  { start: '20.51.84.160', end: '20.51.84.175' },
-  { start: '20.51.84.176', end: '20.51.84.191' },
-  { start: '20.51.84.240', end: '20.51.84.255' },
-  { start: '20.51.85.32', end: '20.51.85.47' },
-  { start: '20.51.85.64', end: '20.51.85.79' },
-  { start: '20.51.85.128', end: '20.51.85.143' },
-  { start: '20.51.85.176', end: '20.51.85.191' },
-  { start: '20.72.226.112', end: '20.72.226.127' },
-  { start: '20.72.226.160', end: '20.72.226.175' },
-  { start: '52.250.84.16', end: '52.250.84.31' },
-  { start: '52.250.87.96', end: '52.250.87.111' },
-  { start: '52.250.87.160', end: '52.250.87.175' },
-  { start: '52.250.87.192', end: '52.250.87.207' },
-  { start: '48.210.5.64', end: '48.210.5.127' },   
-  { start: '48.210.5.128', end: '48.210.5.191' },  
-  { start: '48.210.6.0', end: '48.210.7.255' },    
-  { start: '20.9.200.0', end: '20.9.200.127' },
-  { start: '20.9.200.128', end: '20.9.200.255' },
-  { start: '20.42.182.0', end: '20.42.183.255' },
-  { start: '34.213.208.16', end: '34.213.208.16' },
-  { start: '34.216.170.167', end: '34.216.170.167' },
-  { start: '52.13.201.178', end: '52.13.201.178' },
-  { start: '57.154.81.226', end: '57.154.81.227' }, 
+// --- PlayFab IP allowlist (CIDR notation, matching PlayFab's published list) ---
+// Source: PlayFab dashboard → Settings → Static IP prefixes and addresses
+// To update: edit this array and redeploy.
+const PLAYFAB_CIDRS = [
+  '20.120.128.144/28', '20.120.129.32/28', '20.120.129.96/28',
+  '20.120.129.160/28', '20.120.129.240/28', '20.120.130.208/28',
+  '20.120.131.0/28',   '20.120.131.240/28', '20.120.132.32/28',
+  '20.120.132.208/28', '20.120.133.64/28',  '20.120.133.112/28',
+  '20.252.116.240/28', '20.252.117.240/28', '20.252.118.0/28',
+  '20.252.118.48/28',  '20.252.118.64/28',  '20.252.118.208/28',
+  '20.252.119.16/28',  '20.252.119.176/28', '20.252.119.192/28',
+  '20.252.119.240/28', '20.252.119.48/28',  '20.252.119.96/28',
+  '20.42.182.0/23',
+  '20.51.84.128/28',   '20.51.84.160/28',   '20.51.84.176/28',
+  '20.51.84.240/28',   '20.51.85.32/28',    '20.51.85.64/28',
+  '20.51.85.128/28',   '20.51.85.176/28',
+  '20.72.226.112/28',  '20.72.226.160/28',
+  '20.9.200.0/25',     '20.9.200.128/25',
+  '48.210.5.64/26',    '48.210.5.128/26',   '48.210.6.0/23',
+  '52.250.84.16/28',   '52.250.87.96/28',   '52.250.87.160/28',
+  '52.250.87.192/28',
+  '57.154.81.226/31',
+  '34.213.208.16/32',  '34.216.170.167/32', '52.13.201.178/32',
 ];
 
-// DNS verification config
-const DNS_CONFIG = {
-  maxRetries: 3,           
-  retryDelayMs: 100,       
-  cacheFailuresFor: 30000, 
-};
-
-// Track DNS failure state
-let dnsFailureState = {
-  lastFailure: null,
-  consecutiveFailures: 0,
-};
+// --- CIDR parsing and IP validation ---
 
 function ipToNumber(ip) {
   const parts = ip.split('.').map(Number);
   return ((parts[0] << 24) >>> 0) + (parts[1] << 16) + (parts[2] << 8) + parts[3];
 }
 
+function parseCidr(cidr) {
+  const trimmed = cidr.trim();
+  // Support bare IPs (no /prefix) — treat as /32
+  const slashIdx = trimmed.indexOf('/');
+  const ip     = slashIdx >= 0 ? trimmed.slice(0, slashIdx) : trimmed;
+  const prefix = slashIdx >= 0 ? parseInt(trimmed.slice(slashIdx + 1), 10) : 32;
+  const ipNum  = ipToNumber(ip);
+  const mask   = prefix === 0 ? 0 : (~0 << (32 - prefix)) >>> 0;
+  return { cidr: trimmed, start: (ipNum & mask) >>> 0, end: ((ipNum & mask) | ~mask) >>> 0 };
+}
+
+// Parse CIDRs once at module load (warm instances reuse this)
+const PLAYFAB_IP_RANGES = PLAYFAB_CIDRS.map(parseCidr);
+
+// Startup log — printed once per cold start so you can confirm the ranges in Vercel logs
+console.log(`[RESOLVER INIT] PlayFab IP allowlist loaded: ${PLAYFAB_IP_RANGES.length} CIDR ranges covering ${PLAYFAB_CIDRS.join(', ')}`);
+
 function isValidPlayFabIP(ip) {
   const ipNum = ipToNumber(ip);
-  for (const range of PLAYFAB_VALID_IP_RANGES) {
-    const startNum = ipToNumber(range.start);
-    const endNum = ipToNumber(range.end);
-    if (ipNum >= startNum && ipNum <= endNum) {
-      return true;
-    }
+  for (const range of PLAYFAB_IP_RANGES) {
+    if (ipNum >= range.start && ipNum <= range.end) return true;
   }
   return false;
 }
 
-async function verifyPlayFabDNS(titleId) {
-  const hostname = `${titleId}.playfabapi.com`;
-  
-  if (dnsFailureState.lastFailure) {
-    const elapsed = Date.now() - dnsFailureState.lastFailure;
-    if (elapsed < DNS_CONFIG.cacheFailuresFor && dnsFailureState.consecutiveFailures >= 3) {
-      console.warn(`[SECURITY DNS] Skipping check - in failure cooldown (${Math.round(elapsed/1000)}s ago)`);
-      return { valid: false, ips: [], invalidIps: [], cached: true };
-    }
+// --- DoH providers (tried in order; both use standard DNS-over-HTTPS JSON) ---
+const DOH_PROVIDERS = [
+  { name: 'cloudflare', url: 'https://1.1.1.1/dns-query' },
+  { name: 'google',     url: 'https://8.8.8.8/resolve'   },
+];
+
+// --- Resolver tuning ---
+const RESOLVER_CONFIG = {
+  dohTimeoutMs:    3_000,    // Per-provider DoH query timeout
+  cacheFreshMs:    120_000,  // Consider cache "fresh" for 2 min (skip re-resolve)
+  cacheStaleMs:    600_000,  // Accept stale cache for up to 10 min (emergency fallback)
+};
+
+// --- Slack alerting ---
+const SLACK_SECURITY_WEBHOOK = process.env.SLACK_SECURITY_WEBHOOK_URL || '';
+const SLACK_ALERT_COOLDOWN_MS = 60_000; // Min 60s between Slack messages of same type
+let _slackLastSent = {};                // { eventType: timestamp }
+
+async function sendSlackAlert(eventType, message, details = {}) {
+  if (!SLACK_SECURITY_WEBHOOK) return;
+
+  // Rate-limit per event type to prevent flooding during active attacks
+  const now = Date.now();
+  if (_slackLastSent[eventType] && (now - _slackLastSent[eventType]) < SLACK_ALERT_COOLDOWN_MS) return;
+  _slackLastSent[eventType] = now;
+
+  const blocks = [
+    {
+      type: 'section',
+      text: { type: 'mrkdwn', text: message },
+    },
+  ];
+
+  // Add detail fields if provided
+  const fields = Object.entries(details)
+    .filter(([, v]) => v !== undefined && v !== null)
+    .map(([k, v]) => ({ type: 'mrkdwn', text: `*${k}:*\n${v}` }));
+  if (fields.length > 0) {
+    blocks.push({ type: 'section', fields: fields.slice(0, 10) }); // Slack max 10 fields
   }
-  
-  for (let attempt = 1; attempt <= DNS_CONFIG.maxRetries; attempt++) {
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5_000);
+    await fetch(SLACK_SECURITY_WEBHOOK, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ blocks }),
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+  } catch {
+    // Slack delivery is best-effort — never block the login flow
+  }
+}
+
+// --- Module-level state (persists across warm Vercel invocations) ---
+const resolver = {
+  ips:              [],     // Validated PlayFab IPs from DoH
+  lastResolved:     0,      // Timestamp of last successful DoH resolution
+  resolving:        false,  // Concurrency guard
+};
+
+// --- DNS-over-HTTPS resolution ---
+
+async function resolveViaDoH(hostname) {
+  for (const provider of DOH_PROVIDERS) {
     try {
-      const ips = await dns.resolve4(hostname);
-      const invalidIps = ips.filter(ip => !isValidPlayFabIP(ip));
-      
-      if (invalidIps.length === 0) {
-        dnsFailureState.lastFailure = null;
-        dnsFailureState.consecutiveFailures = 0;
-        return { valid: true, ips, invalidIps: [], attempt };
-      }
-      
-      console.error(`[SECURITY DNS ATTACK] ⚠️ ALERT: DNS hijacking detected! Attempt ${attempt}/${DNS_CONFIG.maxRetries}`);
-      
-      if (attempt < DNS_CONFIG.maxRetries) {
-        await new Promise(r => setTimeout(r, DNS_CONFIG.retryDelayMs));
-      }
-      
-    } catch (e) {
-      console.warn(`[SECURITY DNS] Resolution failed for ${hostname} (attempt ${attempt}): ${e.message}`);
-      if (attempt < DNS_CONFIG.maxRetries) {
-        await new Promise(r => setTimeout(r, DNS_CONFIG.retryDelayMs));
-      }
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), RESOLVER_CONFIG.dohTimeoutMs);
+      const resp = await fetch(`${provider.url}?name=${encodeURIComponent(hostname)}&type=A`, {
+        headers: { Accept: 'application/dns-json' },
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+      if (!resp.ok) continue;
+
+      const data = await resp.json();
+      const ips = (data.Answer || []).filter(a => a.type === 1).map(a => a.data);
+      if (ips.length > 0) return { ips, provider: provider.name };
+    } catch {
+      // Provider unreachable — try next
     }
   }
-  
-  dnsFailureState.lastFailure = Date.now();
-  dnsFailureState.consecutiveFailures++;
-  return { valid: false, ips: [], invalidIps: [], exhausted: true };
+  return { ips: [], provider: null };
+}
+
+// --- Resolver cache management ---
+
+async function refreshResolverCache(titleId) {
+  if (resolver.resolving) return; // Another concurrent invocation is already refreshing
+  resolver.resolving = true;
+  try {
+    const hostname = `${titleId}.playfabapi.com`;
+    const { ips, provider } = await resolveViaDoH(hostname);
+
+    if (ips.length === 0) {
+      console.warn('[RESOLVER] DoH returned no IPs from any provider — retaining existing cache');
+      sendSlackAlert('doh_failure', ':warning: *DoH Resolution Failed*\nBoth Cloudflare (1.1.1.1) and Google (8.8.8.8) DoH returned no IPs. Using cached IPs for now.', {
+        'Cached IPs': resolver.ips.length > 0 ? resolver.ips.join(', ') : 'NONE — logins will fail!',
+        'Cache Age': resolver.lastResolved ? `${Math.round((Date.now() - resolver.lastResolved) / 1000)}s (usable up to ${Math.round(RESOLVER_CONFIG.cacheStaleMs / 1000)}s)` : 'never resolved',
+        'Action Required': resolver.ips.length > 0
+          ? 'Monitor only — cached IPs will sustain logins for up to 10 minutes. If this persists, check Vercel region connectivity and consider redeploying to a different region.'
+          : 'URGENT — No cached IPs available. Player logins are failing. Check Vercel network status and redeploy immediately.',
+      }).catch(() => {});
+      return;
+    }
+
+    const validIps   = ips.filter(ip => isValidPlayFabIP(ip));
+    const invalidIps = ips.filter(ip => !isValidPlayFabIP(ip));
+
+    if (invalidIps.length > 0) {
+      // Even DoH is returning unexpected IPs — extremely unlikely but handle it
+      console.error(`[RESOLVER ALERT] DoH via ${provider} returned IPs outside PlayFab ranges: ${invalidIps.join(', ')} — DISCARDING, retaining cache`);
+      sendSlackAlert('doh_invalid_ips', ':rotating_light: *DoH Returned Invalid PlayFab IPs*\nDoH resolved PlayFab to IPs outside the known CIDR ranges. Discarded — using cached IPs.', {
+        Provider: provider,
+        'Invalid IPs': invalidIps.join(', '),
+        'Valid IPs': validIps.join(', ') || 'none',
+        'Action Required': 'Check if PlayFab has published new IP ranges (Dashboard → Settings → Static IP prefixes). If so, update PLAYFAB_CIDRS in verifyoculuslogin.js and redeploy. If PlayFab ranges haven\'t changed, this may indicate a sophisticated DNS supply-chain attack — escalate immediately.',
+      }).catch(() => {});
+      return;
+    }
+
+    if (validIps.length > 0) {
+      const wasEmpty = resolver.ips.length === 0;
+      resolver.ips = validIps;
+      resolver.lastResolved = Date.now();
+      if (wasEmpty) {
+        // First resolution (cold start) — log for operational confidence
+        console.log(`[RESOLVER READY] DoH via ${provider} resolved PlayFab to ${validIps.length} IPs: ${validIps.join(', ')} | All validated against ${PLAYFAB_IP_RANGES.length} CIDR ranges`);
+      }
+    }
+  } finally {
+    resolver.resolving = false;
+  }
+}
+
+function isCacheFresh() {
+  return resolver.ips.length > 0 && (Date.now() - resolver.lastResolved) < RESOLVER_CONFIG.cacheFreshMs;
+}
+
+function isCacheUsable() {
+  return resolver.ips.length > 0 && (Date.now() - resolver.lastResolved) < RESOLVER_CONFIG.cacheStaleMs;
+}
+
+// --- Pinned https.Agent (routes PlayFab connections through DoH-resolved IPs) ---
+
+let _pinnedAgent = null;
+let _pinnedTitleId = null;
+
+function getPinnedAgent(titleId) {
+  if (_pinnedAgent && _pinnedTitleId === titleId) return _pinnedAgent;
+
+  const pfHost = `${titleId}.playfabapi.com`;
+  _pinnedAgent = new https.Agent({
+    keepAlive: true,
+    maxSockets: 50,
+    lookup: (hostname, options, callback) => {
+      // Only pin PlayFab — everything else falls through to system DNS
+      if (hostname === pfHost && resolver.ips.length > 0) {
+        const ip = resolver.ips[Math.floor(Math.random() * resolver.ips.length)];
+        return callback(null, ip, 4);
+      }
+      dnsLookupCb(hostname, options, callback);
+    },
+  });
+  _pinnedTitleId = titleId;
+  return _pinnedAgent;
+}
+
+// --- Public API: secure PlayFab fetch ---
+
+// Set by handler on each invocation — used by pfFetch and getPinnedAgent
+let _activeTitleId = null;
+
+/**
+ * Drop-in replacement for `fetch()` when calling PlayFab APIs.
+ * Routes the connection through DoH-resolved, IP-validated endpoints
+ * so that local DNS poisoning has zero effect on outbound traffic.
+ *
+ * Usage: replace `fetch(\`https://${titleId}.playfabapi.com/...\`, opts)`
+ *   with `pfFetch(\`https://${titleId}.playfabapi.com/...\`, opts)`
+ * No other changes needed — the titleId is read from module state.
+ */
+function pfFetch(url, options = {}) {
+  return fetch(url, { ...options, agent: getPinnedAgent(_activeTitleId) });
+}
+
+/**
+ * Call at the start of every handler invocation.
+ * Ensures the DoH resolver cache is populated so pfFetch can pin connections
+ * to validated PlayFab IPs.
+ */
+async function ensureResolver(titleId) {
+  // Refresh DoH cache if stale
+  if (!isCacheFresh()) {
+    await refreshResolverCache(titleId);
+  }
+
+  // If cache is completely empty after refresh (first cold-start with no DoH
+  // connectivity at all), we cannot safely route to PlayFab. Return false
+  // so the handler can 503 gracefully — but this is a genuine connectivity
+  // problem, not an attacker-triggerable condition.
+  if (!isCacheUsable()) {
+    console.error('[RESOLVER] No usable PlayFab IPs — DoH unreachable and no cached IPs. Genuine connectivity issue.');
+    sendSlackAlert('resolver_down', ':x: *URGENT — Resolver Down, Player Logins Failing*\nCannot resolve PlayFab IPs via DoH and no cached IPs available. Players are seeing "Unable to connect" errors.', {
+      'DoH Providers Tried': DOH_PROVIDERS.map(p => `${p.name} (${p.url})`).join(', '),
+      'Cache Status': 'Empty — no fallback IPs available',
+      'Player Impact': 'ALL logins failing with 503',
+      'Action Required': '1) Check https://www.vercel-status.com for platform issues.\n2) Check https://status.playfab.com for PlayFab outages.\n3) Try redeploying to force a fresh cold start — this re-attempts DoH resolution.\n4) If DoH is blocked in the Vercel region, consider adding a third DoH provider or hardcoding fallback IPs temporarily.',
+    }).catch(() => {});
+    return false;
+  }
+
+  return true;
 }
 
 // === REASON FLAGS (bitmask) ===
@@ -386,7 +547,7 @@ function worstState(current, candidate, order) {
 async function loadSecurityBlob(titleId, secretKey, playFabId) {
   let resp;
   try {
-    resp = await fetch(`https://${titleId}.playfabapi.com/Server/GetUserInternalData`, {
+    resp = await pfFetch(`https://${titleId}.playfabapi.com/Server/GetUserInternalData`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-SecretKey': secretKey },
       body: JSON.stringify({ PlayFabId: playFabId, Keys: ["Security"] })
@@ -415,7 +576,7 @@ async function loadSecurityBlob(titleId, secretKey, playFabId) {
 
 async function saveSecurityBlob(titleId, secretKey, playFabId, blob) {
   try {
-    const resp = await fetch(`https://${titleId}.playfabapi.com/Server/UpdateUserInternalData`, {
+    const resp = await pfFetch(`https://${titleId}.playfabapi.com/Server/UpdateUserInternalData`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-SecretKey': secretKey },
       body: JSON.stringify({
@@ -457,7 +618,7 @@ const DEVICE_BAN_REGISTRY_KEY = "DeviceBanRegistry";
  */
 async function loadDeviceBanRegistry(titleId, secretKey) {
   try {
-    const resp = await fetch(`https://${titleId}.playfabapi.com/Admin/GetTitleInternalData`, {
+    const resp = await pfFetch(`https://${titleId}.playfabapi.com/Admin/GetTitleInternalData`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-SecretKey': secretKey },
       body: JSON.stringify({ Keys: [DEVICE_BAN_REGISTRY_KEY] })
@@ -485,7 +646,7 @@ async function loadDeviceBanRegistry(titleId, secretKey) {
  */
 async function saveDeviceBanRegistry(titleId, secretKey, registry) {
   try {
-    const resp = await fetch(`https://${titleId}.playfabapi.com/Admin/SetTitleInternalData`, {
+    const resp = await pfFetch(`https://${titleId}.playfabapi.com/Admin/SetTitleInternalData`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-SecretKey': secretKey },
       body: JSON.stringify({ 
@@ -778,7 +939,7 @@ function extractBanInfo(playfabErrorResponse) {
 
 async function getPlayFabIdFromCustomId(metaId, titleId, secretKey) {
   try {
-    const resp = await fetch(`https://${titleId}.playfabapi.com/Server/GetPlayFabIDsFromGenericIDs`, {
+    const resp = await pfFetch(`https://${titleId}.playfabapi.com/Server/GetPlayFabIDsFromGenericIDs`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-SecretKey": secretKey },
       body: JSON.stringify({
@@ -798,7 +959,7 @@ async function getPlayFabIdFromCustomId(metaId, titleId, secretKey) {
 
 async function isDeveloper(playFabId, titleId, secretKey) {
   try {
-    const resp = await fetch(`https://${titleId}.playfabapi.com/Server/GetUserInternalData`, {
+    const resp = await pfFetch(`https://${titleId}.playfabapi.com/Server/GetUserInternalData`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-SecretKey': secretKey },
       body: JSON.stringify({ PlayFabId: playFabId, Keys: ["IsDeveloper"] })
@@ -828,15 +989,23 @@ export default async function handler(req, res) {
     return res.status(500).json({ success: false, error: 'Server misconfigured' });
   }
 
+  // Make titleId available to pfFetch (module-level, safe in single-threaded Node)
+  _activeTitleId = titleId;
+
   // ============================================================================
-  // SECURITY: Verify PlayFab DNS
+  // SECURITY: Initialise DoH-pinned resolver
+  // Populates the IP cache via DNS-over-HTTPS (Cloudflare / Google) so that
+  // all outbound PlayFab calls are routed to validated IPs. System DNS is
+  // never used for PlayFab — local DNS poisoning has no effect.
+  //
+  // The only scenario where this returns 503 is a genuine connectivity
+  // failure where DoH itself is unreachable AND no cached IPs exist —
+  // an attacker cannot trigger this condition by poisoning DNS alone.
   // ============================================================================
-  const dnsCheck = await verifyPlayFabDNS(titleId);
-  if (!dnsCheck.valid) {
-    if (dnsCheck.cached) console.warn(`[SECURITY] Login blocked - DNS in failure cooldown`);
-    else console.error(`[SECURITY] Login blocked - DNS verification failed after ${DNS_CONFIG.maxRetries} attempts`);
-    return res.status(503).json({ 
-      success: false, 
+  const resolverReady = await ensureResolver(titleId);
+  if (!resolverReady) {
+    return res.status(503).json({
+      success: false,
       error: "Service temporarily unavailable",
       errorMessage: "Unable to connect. Please try again."
     });
@@ -1016,7 +1185,7 @@ export default async function handler(req, res) {
           let banReason = "Device ban"; // Default for device-banned users with no PlayFab account
           if (playFabId) {
             try {
-              const getBansResp = await fetch(`https://${titleId}.playfabapi.com/Server/GetUserBans`, {
+              const getBansResp = await pfFetch(`https://${titleId}.playfabapi.com/Server/GetUserBans`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', 'X-SecretKey': secretKey },
                 body: JSON.stringify({ PlayFabId: playFabId })
@@ -1078,7 +1247,7 @@ export default async function handler(req, res) {
     const maxLoginRetries = 2;
     for (let attempt = 1; attempt <= maxLoginRetries; attempt++) {
       try {
-        playfabResp = await fetch(`https://${titleId}.playfabapi.com/Server/LoginWithCustomID`, {
+        playfabResp = await pfFetch(`https://${titleId}.playfabapi.com/Server/LoginWithCustomID`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'X-SecretKey': secretKey },
           body: playfabLoginBody
@@ -1119,7 +1288,7 @@ export default async function handler(req, res) {
 
         if (masterPlayFabId) {
           try {
-            const confirmResp = await fetch(`https://${titleId}.playfabapi.com/Server/GetUserBans`, {
+            const confirmResp = await pfFetch(`https://${titleId}.playfabapi.com/Server/GetUserBans`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json', 'X-SecretKey': secretKey },
               body: JSON.stringify({ PlayFabId: masterPlayFabId })
@@ -1142,6 +1311,13 @@ export default async function handler(req, res) {
         if (!confirmedBan) {
           // LoginWithCustomID said banned, but GetUserBans disagrees — MITM detected
           console.error(`[MITM DEFENSE] Fake ban intercepted! MetaId:${metaId} | PlayFabId:${masterPlayFabId || 'unresolved'} | FakeReason:${banInfo.reason} | FakeExpiry:${banInfo.expiry}`);
+          sendSlackAlert('mitm_fake_ban', ':rotating_light: *MITM Payload Injection — Fake Ban Intercepted*\nPlayFab LoginWithCustomID returned a ban response, but the independent GetUserBans cross-check confirms the player is NOT banned. The fake ban was blocked — the player will retry automatically.', {
+            MetaId: metaId,
+            PlayFabId: masterPlayFabId || 'unresolved',
+            'Injected Reason': banInfo.reason,
+            'Injected Expiry': banInfo.expiry,
+            'Action Required': 'Both PlayFab calls route through DoH-pinned IPs, so this interception should not be possible under normal conditions. If this alert fires repeatedly, the attacker may be operating at the BGP/routing level rather than DNS. Monitor for repeated occurrences — if more than 5 players are affected within a few minutes, redeploy Vercel to force fresh connections and escalate to Vercel support.',
+          }).catch(() => {});
           // Return 503 so client retries (next attempt routes through clean path)
           return res.status(503).json({
             success: false,
@@ -1335,7 +1511,7 @@ export default async function handler(req, res) {
           if (action === "ban") {
             // PlayFab permanent ban
             try {
-              await fetch(`https://${titleId}.playfabapi.com/Server/BanUsers`, {
+              await pfFetch(`https://${titleId}.playfabapi.com/Server/BanUsers`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', 'X-SecretKey': secretKey },
                 body: JSON.stringify({
@@ -1481,7 +1657,7 @@ export default async function handler(req, res) {
     // Newly created: add Generic ID mapping (one-time)
     if (playfabData.data.NewlyCreated) {
       try {
-        await fetch(`https://${titleId}.playfabapi.com/Server/AddGenericID`, {
+        await pfFetch(`https://${titleId}.playfabapi.com/Server/AddGenericID`, {
           method: "POST",
           headers: { "Content-Type": "application/json", "X-SecretKey": secretKey },
           body: JSON.stringify({
