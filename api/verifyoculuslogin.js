@@ -104,10 +104,14 @@ const PLAYFAB_CIDRS = [
   '57.154.81.226/31',
   '34.213.208.16/32',  '34.216.170.167/32', '52.13.201.178/32',
   // Azure Front Door IPs — observed in DoH resolution since PlayFab routing
-  // changes announced 2024-03-24. WHOIS-confirmed Microsoft (NET-13-64-0-0-1).
+  // changes announced 2024-03-24. WHOIS-confirmed Microsoft.
+  // Validated against AzureFrontDoor.Frontend service tag (ServiceTags_Public_20260323.json).
   // Pending formal addition to PlayFab dashboard static IP list.
   // TODO: Remove this comment once PlayFab updates their published prefixes.
   '13.107.213.0/24',   '13.107.246.0/24',
+  '150.171.22.0/23',   '150.171.26.0/24',  '150.171.84.0/22',
+  '150.171.88.0/23',   '150.171.109.0/24', '150.171.110.0/23',
+  '150.171.112.0/24',
 ];
 
 // --- CIDR parsing and IP validation ---
