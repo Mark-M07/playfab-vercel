@@ -60,7 +60,7 @@ const ENFORCEMENT_CONFIG = {
   verification_failed: "block", // Block but don't ban (could be API issue)
   
   // No attestation token provided
-  no_token: "block",            // Modified client
+  no_token: "allow",            // Modified client
 
   // Game version too old (Meta-attested versionCode below minimum)
   version_outdated: "block",    // Block login, prompt update — never ban (could be legit stale install)
