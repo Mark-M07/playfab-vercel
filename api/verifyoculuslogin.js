@@ -470,14 +470,7 @@ function validateCertificate(certHashes) {
 
   // Configured — compare hashes
   if (clientHash !== VALID_CERT_HASH) {
-    const allCertHashes = Array.isArray(certHashes)
-      ? certHashes.map(h => String(h || "").toLowerCase()).join(", ")
-      : String(certHashes ?? "missing");
-
-    console.warn(
-      `[CERT MISMATCH DEBUG] ClientCert:${clientHash || "missing"} | Expected:${VALID_CERT_HASH || "missing"} | AllCertHashes:${allCertHashes}`
-    );
-
+    console.warn(`[CERT MISMATCH] ClientCert:${clientHash || "missing"}`);
     return { checked: true, valid: false, reason: "mismatch", clientHash };
   }
 }
