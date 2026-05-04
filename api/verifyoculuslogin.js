@@ -470,8 +470,12 @@ function validateCertificate(certHashes) {
 
   // Configured — compare hashes
   if (clientHash !== VALID_CERT_HASH) {
+    const allCertHashes = Array.isArray(certHashes)
+      ? certHashes.map(h => String(h || "").toLowerCase()).join(", ")
+      : String(certHashes ?? "missing");
+
     console.warn(
-      `[CERT MISMATCH DEBUG] ClientCert:${clientHash} | Expected:${VALID_CERT_HASH} | AllCertHashes:${JSON.stringify(certHashes)}`
+      `[CERT MISMATCH DEBUG] ClientCert:${clientHash || "missing"} | Expected:${VALID_CERT_HASH || "missing"} | AllCertHashes:${allCertHashes}`
     );
 
     return { checked: true, valid: false, reason: "mismatch", clientHash };
@@ -1247,7 +1251,7 @@ export default async function handler(req, res) {
           console.warn(`[ATTESTATION FAILED] User:${metaId} | Reasons:${attestation.reason}`);
         }
 
-        if (!attestation.cert_check.valid && attestation.cert_check.reason === "mismatch") {
+        if (attestation.cert_check?.valid === false && attestation.cert_check?.reason === "mismatch") {
           console.warn(`[CERT MISMATCH] User:${metaId} | ClientCert:${attestation.cert_check.clientHash} | Expected:${VALID_CERT_HASH}`);
         }
       }
