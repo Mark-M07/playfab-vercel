@@ -470,11 +470,12 @@ function validateCertificate(certHashes) {
 
   // Configured — compare hashes
   if (clientHash !== VALID_CERT_HASH) {
-    return { checked: true, valid: false, reason: "mismatch", clientHash };
-    // becomes "cert_mismatch" after prefix in analyzeAttestationPayload → matches ENFORCEMENT_CONFIG key
-  }
+    console.warn(
+      `[CERT MISMATCH DEBUG] ClientCert:${clientHash} | Expected:${VALID_CERT_HASH} | AllCertHashes:${JSON.stringify(certHashes)}`
+    );
 
-  return { checked: true, valid: true, reason: "ok", clientHash };
+    return { checked: true, valid: false, reason: "mismatch", clientHash };
+  }
 }
 
 /**
