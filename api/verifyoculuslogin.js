@@ -1264,18 +1264,20 @@ export default async function handler(req, res) {
       }
     });
 
-    // === PlayFab Login: timeout + transient-retry (hardened 2026-05-29) ===
-    // Guards two failure modes seen during the PlayFab brownout:
-    //   1. Hung connection (PlayFab accepts the socket but never sends headers)
-    //      previously burned the full 15s function ceiling -> Vercel 504. Each
-    //      attempt now has its own AbortController timeout.
-    //   2. Envoy "upstream connect error ... 503" responses RESOLVE without
-    //      throwing, so the old catch-only loop never retried them. We now retry
-    //      transient 5xx/429 explicitly.
-    // The section is budgeted against the function deadline so retries can never
-    // push past the Vercel ceiling — fail fast and let the client retry clean.
+    // === PlayFab Login: transient-retry (leak-free, v3-safe) ===
+    // Addresses the Envoy "upstream connect error ... 503" failures: those RESOLVE
+    // without throwing, so the old catch-only loop never retried them. We now retry
+    // transient 5xx/429 explicitly. Transient blips become 200s; a sustained PlayFab
+    // outage still ends in a clean 503 (no client code can fix a down upstream).
+    //
+    // DELIBERATELY NO per-attempt timeout here. On node-fetch v3 a timeout requires
+    // an AbortSignal, and AbortSignal + the keepAlive pinned agent is the suspected
+    // source of the MaxListenersExceededWarning leak. So a single hung attempt can
+    // still ride Vercel's 15s ceiling (the 504s) — fixing THAT needs the signal
+    // timeout, which must be proven leak-free on a preview deploy first. See notes.
+    //
+    // No AbortController, no signal -> zero new listeners -> cannot reintroduce the leak.
     const LOGIN_MAX_ATTEMPTS    = 3;        // initial + 2 retries
-    const LOGIN_PER_ATTEMPT_MS  = 6_000;    // hard cap per individual attempt
     const FUNCTION_BUDGET_MS    = 14_000;   // ~1s under Vercel's 15s runtime ceiling
     const POST_LOGIN_RESERVE_MS = 2_000;    // headroom for blob saves / AddGenericID after login
     const LOGIN_RETRY_STATUSES  = new Set([429, 500, 502, 503, 504]);
@@ -1284,7 +1286,7 @@ export default async function handler(req, res) {
     const loginDeadline = HANDLER_START + FUNCTION_BUDGET_MS - POST_LOGIN_RESERVE_MS;
     const sleep         = (ms) => new Promise(r => setTimeout(r, ms));
     // Equal-jitter backoff — spreads retries so a brownout doesn't synchronise a
-    // thundering herd of clients all retrying on the same beat.
+    // thundering herd of clients retrying on the same beat.
     const loginBackoffMs = (attempt) => {
       const base = Math.min(250 * 2 ** (attempt - 1), 1_000);
       return Math.round(base / 2 + Math.random() * (base / 2));
@@ -1293,23 +1295,16 @@ export default async function handler(req, res) {
     let playfabResp;
     let playfabData;
     for (let attempt = 1; attempt <= LOGIN_MAX_ATTEMPTS; attempt++) {
-      const remaining = loginDeadline - Date.now();
-      if (remaining < 1_000) {
-        console.error(`[PLAYFAB LOGIN] Budget exhausted before attempt ${attempt} (${remaining}ms left) | MetaId:${metaId}`);
+      if ((loginDeadline - Date.now()) < 1_000) {
+        console.error(`[PLAYFAB LOGIN] Budget exhausted before attempt ${attempt} | MetaId:${metaId}`);
         break;
       }
-      const attemptTimeout = Math.min(LOGIN_PER_ATTEMPT_MS, remaining);
-      const controller = new AbortController();
-      const timeoutId  = setTimeout(() => controller.abort(), attemptTimeout);
-
       try {
         const resp = await pfFetch(loginUrl, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'X-SecretKey': secretKey },
-          body: playfabLoginBody,
-          signal: controller.signal
+          body: playfabLoginBody
         });
-        clearTimeout(timeoutId);
 
         // Transient upstream failure (incl. the Envoy "upstream connect error" 503,
         // which lands HERE, not in catch). Retry if attempts + budget remain.
@@ -1323,9 +1318,7 @@ export default async function handler(req, res) {
         playfabResp = resp; // 2xx, non-retryable status (e.g. ban 4xx), or out of attempts/budget
         break;
       } catch (e) {
-        clearTimeout(timeoutId);
-        const reason = e.name === 'AbortError' ? `timeout after ${attemptTimeout}ms` : (e.code || e.message);
-        console.error(`[PLAYFAB LOGIN] Connection failed (attempt ${attempt}/${LOGIN_MAX_ATTEMPTS}): ${reason} | MetaId:${metaId}`);
+        console.error(`[PLAYFAB LOGIN] Network error (attempt ${attempt}/${LOGIN_MAX_ATTEMPTS}): ${e.code || e.message} | MetaId:${metaId}`);
         if (attempt < LOGIN_MAX_ATTEMPTS && (loginDeadline - Date.now()) > 1_000) {
           await sleep(loginBackoffMs(attempt));
           continue;
