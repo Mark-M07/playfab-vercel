@@ -14,6 +14,7 @@ import fetch from "node-fetch";
  *    PLAYFAB_DEV_SECRET_KEY        - required for buyer PlayFab lookup + writes
  *    META_IAP_ORDER_STATUS_WRITE   - set to "1" to write to PlayFab, otherwise, it's a dry-run
 
+ *    28914815224829230 (Conehead91), 9062660193814011 (Ogethel)
  *
  * Meta dashboard test mode (no env var required):
  *    user_id 10149999707612630 → 28914815224829230 (Conehead91), item_sku_1 → random durable bundle SKU,
@@ -30,6 +31,7 @@ import fetch from "node-fetch";
  *    Search "[META_WEBHOOK][verification]" for Meta dashboard setup / re-verification GETs
  *    Search "[META_WEBHOOK][playfab-lookup]" for Meta ID → PlayFab profile resolution
  *    Search "[META_WEBHOOK][dashboard-test]" for Meta dashboard test payload overrides
+ *    Search "[META_WEBHOOK][live-write-test]" for whitelisted Meta IDs with live writes
  *    Search "[META_WEBHOOK][order-status-dry-run]" for Read Only Data writes that would occur
  *    Search "[META_WEBHOOK][order-status-write]" for live Read Only Data writes (dashboard test user only)
  *
@@ -62,6 +64,11 @@ const DASHBOARD_TEST_DURABLE_SKUS = [
   "Bundle_Xenodon",
   "Bundle_Prugator",
 ];
+/** Real Meta IDs that always write PlayerOrderStatusData (pre–full rollout testing). */
+const LIVE_WRITE_TEST_META_IDS = new Set([
+  "28914815224829230",
+  "9062660193814011",
+]);
 
 function isIgnoredConsumableSku(sku) {
   return Boolean(sku && IGNORED_CONSUMABLE_SKUS.has(sku));
@@ -69,6 +76,18 @@ function isIgnoredConsumableSku(sku) {
 
 function isMetaDashboardTestUser(metaId) {
   return String(metaId) === META_DASHBOARD_TEST_META_ID;
+}
+
+function isLiveWriteTestUser(metaId) {
+  return LIVE_WRITE_TEST_META_IDS.has(String(metaId));
+}
+
+function shouldWriteOrderStatus(event) {
+  return (
+    Boolean(event.isDashboardTest) ||
+    isLiveWriteTestUser(event.userId) ||
+    process.env.META_IAP_ORDER_STATUS_WRITE === "1"
+  );
 }
 
 function pickRandomDashboardTestSku() {
@@ -112,6 +131,20 @@ function applyDashboardTestOverrides(event) {
   });
 
   return translated;
+}
+
+function logLiveWriteTestUser(event) {
+  if (!isLiveWriteTestUser(event.userId) || event.isDashboardTest) {
+    return event;
+  }
+
+  log("info", "live-write-test", "Whitelisted Meta ID — will write PlayerOrderStatusData", {
+    metaId: event.userId,
+    sku: event.sku,
+    reportingId: event.reportingId,
+  });
+
+  return { ...event, isLiveWriteTest: true };
 }
 
 /** Plain fetch to PlayFab — no DoH pinning (see rotatetoken.js). */
@@ -332,9 +365,7 @@ async function processOrderStatusEvent(event) {
 
   const titleId = process.env.PLAYFAB_TITLE_ID;
   const secretKey = process.env.PLAYFAB_DEV_SECRET_KEY;
-  const writeEnabled =
-    Boolean(event.isDashboardTest) ||
-    process.env.META_IAP_ORDER_STATUS_WRITE === "1";
+  const writeEnabled = shouldWriteOrderStatus(event);
 
   let buyer = null;
   if (titleId && secretKey && event.userId) {
@@ -702,7 +733,7 @@ async function handleEventNotification(req, res) {
   } else {
     for (const rawEvent of orderEvents) {
       log("info", "order_status", "Order event received", rawEvent);
-      const event = applyDashboardTestOverrides(rawEvent);
+      const event = logLiveWriteTestUser(applyDashboardTestOverrides(rawEvent));
       try {
         await processOrderStatusEvent(event);
       } catch (err) {
