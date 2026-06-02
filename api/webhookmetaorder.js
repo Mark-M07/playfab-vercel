@@ -33,9 +33,16 @@ function readRawBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     req.on("data", (chunk) => chunks.push(chunk));
-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    req.on("end", () => resolve(Buffer.concat(chunks)));
     req.on("error", reject);
   });
+}
+
+/** Avoid req.query — Vercel/Node may parse via deprecated url.parse(). */
+function parseQueryParams(req) {
+  const host = req.headers.host || "localhost";
+  const url = new URL(req.url || "/", `https://${host}`);
+  return url.searchParams;
 }
 
 function log(level, tag, message, details = undefined) {
@@ -51,25 +58,31 @@ function log(level, tag, message, details = undefined) {
   }
 }
 
-function timingSafeEqual(a, b) {
+function timingSafeEqualHex(a, b) {
   if (typeof a !== "string" || typeof b !== "string") return false;
-  const aBuf = Buffer.from(a, "utf8");
-  const bBuf = Buffer.from(b, "utf8");
-  if (aBuf.length !== bBuf.length) return false;
-  return crypto.timingSafeEqual(aBuf, bBuf);
+  if (a.length !== b.length) return false;
+  try {
+    return crypto.timingSafeEqual(Buffer.from(a, "hex"), Buffer.from(b, "hex"));
+  } catch {
+    return false;
+  }
 }
 
-function validateSignature(rawBody, signatureHeader, appSecret) {
+function validateSignature(rawBodyBuffer, signatureHeader, appSecret) {
   if (!signatureHeader || !appSecret) {
     return { checked: false, valid: true, reason: "not_configured" };
   }
 
-  const expected = `sha256=${crypto
+  const expectedHex = crypto
     .createHmac("sha256", appSecret)
-    .update(rawBody, "utf8")
-    .digest("hex")}`;
+    .update(rawBodyBuffer)
+    .digest("hex");
 
-  const valid = timingSafeEqual(expected, signatureHeader);
+  const receivedHex = signatureHeader.startsWith("sha256=")
+    ? signatureHeader.slice(7)
+    : signatureHeader;
+
+  const valid = timingSafeEqualHex(expectedHex, receivedHex);
   return { checked: true, valid, reason: valid ? "ok" : "mismatch" };
 }
 
@@ -127,9 +140,10 @@ function summarizePayload(payload) {
 
 async function handleVerification(req, res) {
   const verifyToken = process.env.META_WEBHOOK_VERIFY_TOKEN;
-  const mode = req.query["hub.mode"];
-  const challenge = req.query["hub.challenge"];
-  const token = req.query["hub.verify_token"];
+  const params = parseQueryParams(req);
+  const mode = params.get("hub.mode");
+  const challenge = params.get("hub.challenge");
+  const token = params.get("hub.verify_token");
 
   log("info", "verification", "Incoming verification request", {
     mode,
@@ -165,9 +179,9 @@ async function handleEventNotification(req, res) {
     process.env.OCULUS_APP_SECRET || process.env.META_APP_SECRET;
   const skipSignature = process.env.META_WEBHOOK_SKIP_SIGNATURE === "1";
 
-  let rawBody = "";
+  let rawBodyBuffer;
   try {
-    rawBody = await readRawBody(req);
+    rawBodyBuffer = await readRawBody(req);
   } catch (err) {
     log("error", "event", "Failed to read request body", {
       error: err.message,
@@ -176,11 +190,17 @@ async function handleEventNotification(req, res) {
   }
 
   const signatureHeader = req.headers["x-hub-signature-256"];
-  const signature = validateSignature(rawBody, signatureHeader, appSecret);
+  const signature = validateSignature(
+    rawBodyBuffer,
+    signatureHeader,
+    appSecret,
+  );
 
   if (signature.checked && !signature.valid) {
     log("warn", "event", "Signature mismatch", {
       skipSignature,
+      hasAppSecret: Boolean(appSecret),
+      bodyByteLength: rawBodyBuffer.length,
       receivedPrefix: String(signatureHeader || "").slice(0, 20),
     });
     if (!skipSignature) {
@@ -196,13 +216,16 @@ async function handleEventNotification(req, res) {
     );
   }
 
+  const rawBodyText = rawBodyBuffer.length
+    ? rawBodyBuffer.toString("utf8")
+    : "";
   let payload;
   try {
-    payload = rawBody ? JSON.parse(rawBody) : null;
+    payload = rawBodyText ? JSON.parse(rawBodyText) : null;
   } catch (err) {
     log("error", "event", "Body is not valid JSON", {
       error: err.message,
-      preview: rawBody.slice(0, 400),
+      preview: rawBodyText.slice(0, 400),
     });
     return res.status(400).json({ success: false, error: "Invalid JSON" });
   }
