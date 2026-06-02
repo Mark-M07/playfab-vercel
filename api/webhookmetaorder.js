@@ -13,6 +13,11 @@ import fetch from "node-fetch";
  *    PLAYFAB_TITLE_ID              - required for buyer PlayFab lookup + writes
  *    PLAYFAB_DEV_SECRET_KEY        - required for buyer PlayFab lookup + writes
  *    META_IAP_ORDER_STATUS_WRITE   - set to "1" to write to PlayFab, otherwise, it's a dry-run
+
+ *
+ * Meta dashboard test mode (no env var required):
+ *    user_id 10149999707612630 → 28914815224829230 (Conehead91), item_sku_1 → random durable bundle SKU,
+ *    always writes PlayerOrderStatusData to the target account for testing purposes
  *
  * Optional env vars:
  *   OCULUS_APP_SECRET            - used to validate against the signed SHA256 Meta sends in their payload's X-Hub-Signature-256 header
@@ -24,7 +29,9 @@ import fetch from "node-fetch";
  *    Search "[META_WEBHOOK][order_status]" for purchase/refund events only
  *    Search "[META_WEBHOOK][verification]" for Meta dashboard setup / re-verification GETs
  *    Search "[META_WEBHOOK][playfab-lookup]" for Meta ID → PlayFab profile resolution
+ *    Search "[META_WEBHOOK][dashboard-test]" for Meta dashboard test payload overrides
  *    Search "[META_WEBHOOK][order-status-dry-run]" for Read Only Data writes that would occur
+ *    Search "[META_WEBHOOK][order-status-write]" for live Read Only Data writes (dashboard test user only)
  *
  * @route GET|POST /api/webhookmetaorder
  */
@@ -44,9 +51,67 @@ const IGNORED_CONSUMABLE_SKUS = new Set([
   "Nugs_5000",
   "Nugs_11000",
 ]);
+/** Meta dashboard "Send to My Server" sends this fake Meta ID — map to a real test account. */
+const META_DASHBOARD_TEST_META_ID = "10149999707612630";
+const META_DASHBOARD_TEST_TARGET_META_ID = "28914815224829230";
+const META_DASHBOARD_TEST_SKU = "item_sku_1";
+const DASHBOARD_TEST_DURABLE_SKUS = [
+  "Bundle_HammerHug",
+  "Bundle_WaveRider",
+  "Bundle_XvP",
+  "Bundle_Xenodon",
+  "Bundle_Prugator",
+];
 
 function isIgnoredConsumableSku(sku) {
   return Boolean(sku && IGNORED_CONSUMABLE_SKUS.has(sku));
+}
+
+function isMetaDashboardTestUser(metaId) {
+  return String(metaId) === META_DASHBOARD_TEST_META_ID;
+}
+
+function pickRandomDashboardTestSku() {
+  return DASHBOARD_TEST_DURABLE_SKUS[
+    crypto.randomInt(0, DASHBOARD_TEST_DURABLE_SKUS.length)
+  ];
+}
+
+/** Rewrite Meta dashboard test payloads to hit a real PlayFab account with varied durable SKUs. */
+function applyDashboardTestOverrides(event) {
+  if (!isMetaDashboardTestUser(event.userId)) {
+    return event;
+  }
+
+  const original = {
+    userId: event.userId,
+    sku: event.sku,
+    reportingId: event.reportingId,
+  };
+
+  const translated = {
+    ...event,
+    userId: META_DASHBOARD_TEST_TARGET_META_ID,
+    isDashboardTest: true,
+  };
+
+  if (translated.sku === META_DASHBOARD_TEST_SKU) {
+    translated.sku = pickRandomDashboardTestSku();
+  }
+
+  // Dashboard test reuses the same reporting_id every send — synthesize one per click.
+  translated.reportingId = crypto.randomUUID();
+
+  log("info", "dashboard-test", "Applied Meta dashboard test overrides", {
+    original,
+    translated: {
+      userId: translated.userId,
+      sku: translated.sku,
+      reportingId: translated.reportingId,
+    },
+  });
+
+  return translated;
 }
 
 /** Plain fetch to PlayFab — no DoH pinning (see rotatetoken.js). */
@@ -205,7 +270,27 @@ function mergeOrderStatusData(current, entry) {
   };
 }
 
-async function processOrderStatusDryRun(event) {
+async function writePlayerOrderStatusData(playFabId, value, titleId, secretKey) {
+  const { ok, data } = await playFabApi(
+    "/Server/UpdateUserReadOnlyData",
+    titleId,
+    secretKey,
+    {
+      PlayFabId: playFabId,
+      Data: {
+        [PLAYER_ORDER_STATUS_DATA_KEY]: JSON.stringify(value),
+      },
+    },
+  );
+
+  return {
+    ok,
+    error: ok ? null : data?.errorMessage || data?.error || "write_failed",
+    data,
+  };
+}
+
+async function processOrderStatusEvent(event) {
   if (isIgnoredConsumableSku(event.sku)) {
     log(
       "info",
@@ -247,7 +332,9 @@ async function processOrderStatusDryRun(event) {
 
   const titleId = process.env.PLAYFAB_TITLE_ID;
   const secretKey = process.env.PLAYFAB_DEV_SECRET_KEY;
-  const writeEnabled = process.env.META_IAP_ORDER_STATUS_WRITE === "1";
+  const writeEnabled =
+    Boolean(event.isDashboardTest) ||
+    process.env.META_IAP_ORDER_STATUS_WRITE === "1";
 
   let buyer = null;
   if (titleId && secretKey && event.userId) {
@@ -353,17 +440,47 @@ async function processOrderStatusDryRun(event) {
 
   log(
     "info",
-    "order-status-dry-run",
-    "Would update player IAP order statuses",
+    writeEnabled ? "order-status-write" : "order-status-dry-run",
+    writeEnabled
+      ? "Updating player IAP order statuses"
+      : "Would update player IAP order statuses",
     wouldWrite,
   );
 
-  if (writeEnabled) {
-    log(
-      "warn",
-      "order-status-dry-run",
-      "META_IAP_ORDER_STATUS_WRITE=1 but persist is not implemented yet — no PlayFab write performed",
-    );
+  if (writeEnabled && action === "append") {
+    try {
+      const writeResult = await writePlayerOrderStatusData(
+        buyer.playFabId,
+        merged,
+        titleId,
+        secretKey,
+      );
+
+      if (writeResult.ok) {
+        log("info", "order-status-write", "PlayerOrderStatusData write succeeded", {
+          playFabId: buyer.playFabId,
+          displayName: buyer.profile?.displayName ?? null,
+          key: PLAYER_ORDER_STATUS_DATA_KEY,
+          mergedValue: merged,
+        });
+      } else {
+        log("error", "order-status-write", "PlayerOrderStatusData write failed", {
+          playFabId: buyer.playFabId,
+          error: writeResult.error,
+          mergedValue: merged,
+        });
+      }
+    } catch (err) {
+      log("error", "order-status-write", "PlayerOrderStatusData write exception", {
+        playFabId: buyer.playFabId,
+        error: err.message,
+      });
+    }
+  } else if (writeEnabled && action === "skip_duplicate") {
+    log("info", "order-status-write", "Write skipped — duplicate reporting_id", {
+      playFabId: buyer.playFabId,
+      reportingId: entry.reporting_id,
+    });
   }
 }
 
@@ -583,15 +700,16 @@ async function handleEventNotification(req, res) {
       },
     );
   } else {
-    for (const event of orderEvents) {
-      log("info", "order_status", "Order event received", event);
+    for (const rawEvent of orderEvents) {
+      log("info", "order_status", "Order event received", rawEvent);
+      const event = applyDashboardTestOverrides(rawEvent);
       try {
-        await processOrderStatusDryRun(event);
+        await processOrderStatusEvent(event);
       } catch (err) {
         log(
           "error",
           "order-status-dry-run",
-          "Unexpected error during dry-run processing",
+          "Unexpected error during order status processing",
           {
             reportingId: event.reportingId,
             error: err.message,
