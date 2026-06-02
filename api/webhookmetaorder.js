@@ -1,4 +1,5 @@
 import crypto from "crypto";
+import fetch from "node-fetch";
 
 /**
  * Meta webhook receiver for IAP order_status event.
@@ -7,6 +8,11 @@ import crypto from "crypto";
  * Required env vars:
  *    META_WEBHOOK_VERIFY_TOKEN   - must match the "Verify token" field on the dashboard-created webhook
  *                                - see -> https://developers.meta.com/horizon/manage/applications/8485526434899813/platform-services/webhooks/
+ *
+ * Phase 2 (registry) env vars:
+ *    PLAYFAB_TITLE_ID            - required for buyer PlayFab lookup + writes
+ *    PLAYFAB_DEV_SECRET_KEY      - required for buyer PlayFab lookup + writes
+ *    META_IAP_REGISTRY_WRITE     - set to "1" to write to PlayFab, otherwise, it's a dry-run
  *
  * Optional env vars:
  *   OCULUS_APP_SECRET            - used to validate against the signed SHA256 Meta sends in their payload's X-Hub-Signature-256 header
@@ -17,10 +23,11 @@ import crypto from "crypto";
  *    Search "[META_WEBHOOK]" for all webhook traffic
  *    Search "[META_WEBHOOK][order_status]" for purchase/refund events only
  *    Search "[META_WEBHOOK][verification]" for Meta dashboard setup / re-verification GETs
+ *    Search "[META_WEBHOOK][playfab-lookup]" for Meta ID → PlayFab profile resolution
+ *    Search "[META_WEBHOOK][registry-dry-run]" for Title Internal Data upserts that would occur
  *
  * @route GET|POST /api/webhookmetaorder
  */
-
 export const config = {
   api: {
     bodyParser: false,
@@ -28,6 +35,187 @@ export const config = {
 };
 
 const LOG_PREFIX = "[META_WEBHOOK]";
+const REGISTRY_TITLE_INTERNAL_KEY = "MetaIapPurchaseRegistry";
+
+/** Plain fetch to PlayFab — no DoH pinning (see rotatetoken.js). */
+async function playFabApi(path, titleId, secretKey, body) {
+  const resp = await fetch(`https://${titleId}.playfabapi.com${path}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-SecretKey": secretKey,
+    },
+    body: JSON.stringify(body),
+  });
+  const data = await resp.json().catch(() => null);
+  return { ok: resp.ok, status: resp.status, data };
+}
+
+async function getPlayFabIdFromMetaId(metaId, titleId, secretKey) {
+  const { ok, data } = await playFabApi(
+    "/Server/GetPlayFabIDsFromGenericIDs",
+    titleId,
+    secretKey,
+    {
+      GenericIDs: [{ ServiceName: "CustomId", UserId: String(metaId) }],
+    },
+  );
+
+  if (!ok) {
+    return {
+      playFabId: null,
+      error: data?.errorMessage || data?.error || "lookup_failed",
+    };
+  }
+
+  const playFabId = data?.data?.Data?.[0]?.PlayFabId ?? null;
+  return { playFabId, error: playFabId ? null : "no_playfab_account" };
+}
+
+async function getPlayerProfileSummary(playFabId, titleId, secretKey) {
+  const { ok, data } = await playFabApi(
+    "/Server/GetPlayerProfile",
+    titleId,
+    secretKey,
+    {
+      PlayFabId: playFabId,
+      ProfileConstraints: {
+        ShowDisplayName: true,
+        ShowCreated: true,
+        ShowLastLogin: true,
+      },
+    },
+  );
+
+  if (!ok) {
+    return {
+      error: data?.errorMessage || data?.error || "profile_fetch_failed",
+    };
+  }
+
+  const profile = data?.data?.PlayerProfile;
+  return {
+    displayName: profile?.DisplayName ?? null,
+    created: profile?.Created ?? null,
+    lastLogin: profile?.LastLogin ?? null,
+  };
+}
+
+async function lookupBuyerPlayFabProfile(metaId, titleId, secretKey) {
+  const lookup = await getPlayFabIdFromMetaId(metaId, titleId, secretKey);
+
+  if (!lookup.playFabId) {
+    return {
+      metaId: String(metaId),
+      playFabId: null,
+      accountExists: false,
+      lookupError: lookup.error,
+      profile: null,
+    };
+  }
+
+  const profile = await getPlayerProfileSummary(
+    lookup.playFabId,
+    titleId,
+    secretKey,
+  );
+
+  return {
+    metaId: String(metaId),
+    playFabId: lookup.playFabId,
+    accountExists: true,
+    lookupError: profile.error ?? null,
+    profile: profile.error
+      ? null
+      : {
+          displayName: profile.displayName,
+          created: profile.created,
+          lastLogin: profile.lastLogin,
+        },
+  };
+}
+
+function normalizeDeveloperPayload(value) {
+  if (value == null || value === "" || value === '""') return null;
+  return value;
+}
+
+function buildRegistryEntry(event, ownerPlayFabId) {
+  const status = event.notificationType || "UNKNOWN";
+  return {
+    ownerMetaId: event.userId ? String(event.userId) : null,
+    ownerPlayFabId: ownerPlayFabId ?? null,
+    sku: event.sku ?? null,
+    purchasedAt: event.eventTime ? Number(event.eventTime) : null,
+    status,
+    notificationType: event.notificationType ?? null,
+    developerPayload: normalizeDeveloperPayload(event.developerPayload),
+    webhookReceivedAt: new Date().toISOString(),
+    grantedToPlayFabId: null,
+    grantedAt: null,
+  };
+}
+
+async function processRegistryDryRun(event) {
+  if (!event.reportingId) {
+    log("warn", "registry-dry-run", "Skipping — event has no reportingId", {
+      sku: event.sku,
+      userId: event.userId,
+    });
+    return;
+  }
+
+  const titleId = process.env.PLAYFAB_TITLE_ID;
+  const secretKey = process.env.PLAYFAB_DEV_SECRET_KEY;
+  const writeEnabled = process.env.META_IAP_REGISTRY_WRITE === "1";
+
+  let buyer = null;
+  if (titleId && secretKey && event.userId) {
+    try {
+      buyer = await lookupBuyerPlayFabProfile(event.userId, titleId, secretKey);
+      log("info", "playfab-lookup", "Buyer profile lookup", buyer);
+    } catch (err) {
+      log("error", "playfab-lookup", "Buyer profile lookup failed", {
+        metaId: event.userId,
+        error: err.message,
+      });
+    }
+  } else if (event.userId) {
+    log(
+      "warn",
+      "playfab-lookup",
+      "Skipping lookup — PLAYFAB_TITLE_ID or PLAYFAB_DEV_SECRET_KEY not configured",
+    );
+  }
+
+  const registryEntry = buildRegistryEntry(event, buyer?.playFabId ?? null);
+
+  // Title Internal Data is title-wide (not per-player UserData). Keyed by reporting_id inside the blob.
+  const wouldWrite = {
+    dryRun: !writeEnabled,
+    writeTarget: "TitleInternalData",
+    api: "Admin/SetTitleInternalData",
+    key: REGISTRY_TITLE_INTERNAL_KEY,
+    upsert: {
+      [event.reportingId]: registryEntry,
+    },
+  };
+
+  log(
+    "info",
+    "registry-dry-run",
+    "Would upsert IAP ownership registry entry",
+    wouldWrite,
+  );
+
+  if (writeEnabled) {
+    log(
+      "warn",
+      "registry-dry-run",
+      "META_IAP_REGISTRY_WRITE=1 but persist is not implemented yet — no PlayFab write performed",
+    );
+  }
+}
 
 function readRawBody(req) {
   return new Promise((resolve, reject) => {
@@ -247,6 +435,19 @@ async function handleEventNotification(req, res) {
   } else {
     for (const event of orderEvents) {
       log("info", "order_status", "Order event received", event);
+      try {
+        await processRegistryDryRun(event);
+      } catch (err) {
+        log(
+          "error",
+          "registry-dry-run",
+          "Unexpected error during dry-run processing",
+          {
+            reportingId: event.reportingId,
+            error: err.message,
+          },
+        );
+      }
     }
   }
 

@@ -1,0 +1,114 @@
+{
+  "_source": "playfab-ug production webhook captures, 2026-06-02",
+  "_note": "Dashboard test uses appId \"0\" and placeholder SKU. Real purchase confirms live field shape matches test.",
+
+  "dashboardTest": {
+    "extractedEvent": {
+      "appId": "0",
+      "webhookTime": 1780420011,
+      "eventTime": "1659742639",
+      "userId": "10149999707612630",
+      "notificationType": "PURCHASED",
+      "reportingId": "03f8833e-9c02-4fa0-978f-4cfe91f86bae",
+      "sku": "item_sku_1",
+      "developerPayload": "{\"quoteId\": 1234567}",
+      "rawValue": {
+        "event_time": "1659742639",
+        "user_id": "10149999707612630",
+        "product_info": {
+          "notification_type": "PURCHASED",
+          "reporting_id": "03f8833e-9c02-4fa0-978f-4cfe91f86bae",
+          "sku": "item_sku_1",
+          "developer_payload": "{\"quoteId\": 1234567}"
+        }
+      }
+    },
+    "rawWebhookBody": {
+      "object": "application",
+      "entry": [
+        {
+          "id": "0",
+          "time": 1780420011,
+          "changes": [
+            {
+              "field": "order_status",
+              "value": {
+                "event_time": "1659742639",
+                "user_id": "10149999707612630",
+                "product_info": {
+                  "notification_type": "PURCHASED",
+                  "reporting_id": "03f8833e-9c02-4fa0-978f-4cfe91f86bae",
+                  "sku": "item_sku_1",
+                  "developer_payload": "{\"quoteId\": 1234567}"
+                }
+              }
+            }
+          ]
+        }
+      ]
+    }
+  },
+
+  "realPurchase": {
+    "_capturedAt": "2026-06-02",
+    "extractedEvent": {
+      "appId": "1176155782242424",
+      "webhookTime": 1780420524,
+      "eventTime": "1780420519",
+      "userId": "35675740662024474",
+      "notificationType": "PURCHASED",
+      "reportingId": "9ed497fb-7c3f-4e0e-afb8-ca286198ac9b",
+      "sku": "Bundle_Xenodon",
+      "developerPayload": "\"\"",
+      "rawValue": {
+        "event_time": "1780420519",
+        "user_id": "35675740662024474",
+        "product_info": {
+          "notification_type": "PURCHASED",
+          "reporting_id": "9ed497fb-7c3f-4e0e-afb8-ca286198ac9b",
+          "sku": "Bundle_Xenodon",
+          "developer_payload": "\"\""
+        }
+      }
+    },
+    "rawWebhookBody": {
+      "object": "application",
+      "entry": [
+        {
+          "id": "1176155782242424",
+          "time": 1780420524,
+          "changes": [
+            {
+              "field": "order_status",
+              "value": {
+                "event_time": "1780420519",
+                "user_id": "35675740662024474",
+                "product_info": {
+                  "notification_type": "PURCHASED",
+                  "reporting_id": "9ed497fb-7c3f-4e0e-afb8-ca286198ac9b",
+                  "sku": "Bundle_Xenodon",
+                  "developer_payload": "\"\""
+                }
+              }
+            }
+          ]
+        }
+      ]
+    }
+  },
+
+  "testVsRealDifferences": {
+    "appId": "Test \"0\" vs real Meta application id string",
+    "developerPayload": "Test has JSON quoteId; real purchase sent empty string \"\\\"\\\"\"",
+    "eventTime": "Real uses current Unix timestamp string; test uses doc example value",
+    "fieldShape": "Identical — snake_case in rawValue, same nesting under product_info"
+  },
+
+  "phase2Fields": {
+    "ownershipKey": "reportingId",
+    "buyerMetaId": "userId",
+    "registryStatus": "notificationType",
+    "sku": "sku",
+    "purchasedAt": "eventTime"
+  }
+}
