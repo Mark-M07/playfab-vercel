@@ -9,10 +9,10 @@ import fetch from "node-fetch";
  *    META_WEBHOOK_VERIFY_TOKEN   - must match the "Verify token" field on the dashboard-created webhook
  *                                - see -> https://developers.meta.com/horizon/manage/applications/8485526434899813/platform-services/webhooks/
  *
- * Phase 2 (registry) env vars:
- *    PLAYFAB_TITLE_ID            - required for buyer PlayFab lookup + writes
- *    PLAYFAB_DEV_SECRET_KEY      - required for buyer PlayFab lookup + writes
- *    META_IAP_REGISTRY_WRITE     - set to "1" to write to PlayFab, otherwise, it's a dry-run
+ * Phase 2 (order status ownership) env vars:
+ *    PLAYFAB_TITLE_ID              - required for buyer PlayFab lookup + writes
+ *    PLAYFAB_DEV_SECRET_KEY        - required for buyer PlayFab lookup + writes
+ *    META_IAP_ORDER_STATUS_WRITE   - set to "1" to write to PlayFab, otherwise, it's a dry-run
  *
  * Optional env vars:
  *   OCULUS_APP_SECRET            - used to validate against the signed SHA256 Meta sends in their payload's X-Hub-Signature-256 header
@@ -24,7 +24,7 @@ import fetch from "node-fetch";
  *    Search "[META_WEBHOOK][order_status]" for purchase/refund events only
  *    Search "[META_WEBHOOK][verification]" for Meta dashboard setup / re-verification GETs
  *    Search "[META_WEBHOOK][playfab-lookup]" for Meta ID → PlayFab profile resolution
- *    Search "[META_WEBHOOK][registry-dry-run]" for Title Internal Data upserts that would occur
+ *    Search "[META_WEBHOOK][order-status-dry-run]" for Read Only Data writes that would occur
  *
  * @route GET|POST /api/webhookmetaorder
  */
@@ -35,7 +35,19 @@ export const config = {
 };
 
 const LOG_PREFIX = "[META_WEBHOOK]";
-const REGISTRY_TITLE_INTERNAL_KEY = "MetaIapPurchaseRegistry";
+/** Read Only User Data key — separate from client-managed PlayerBundleData. */
+const PLAYER_ORDER_STATUS_DATA_KEY = "PlayerOrderStatusData";
+/** Consumable currency SKUs — durable ownership tracking not needed. */
+const IGNORED_CONSUMABLE_SKUS = new Set([
+  "Nugs_1000",
+  "Nugs_2200",
+  "Nugs_5000",
+  "Nugs_11000",
+]);
+
+function isIgnoredConsumableSku(sku) {
+  return Boolean(sku && IGNORED_CONSUMABLE_SKUS.has(sku));
+}
 
 /** Plain fetch to PlayFab — no DoH pinning (see rotatetoken.js). */
 async function playFabApi(path, titleId, secretKey, body) {
@@ -135,39 +147,107 @@ async function lookupBuyerPlayFabProfile(metaId, titleId, secretKey) {
   };
 }
 
-function normalizeDeveloperPayload(value) {
-  if (value == null || value === "" || value === '""') return null;
-  return value;
+async function getPlayerOrderStatusData(playFabId, titleId, secretKey) {
+  const { ok, data } = await playFabApi(
+    "/Server/GetUserReadOnlyData",
+    titleId,
+    secretKey,
+    {
+      PlayFabId: playFabId,
+      Keys: [PLAYER_ORDER_STATUS_DATA_KEY],
+    },
+  );
+
+  if (!ok) {
+    return {
+      error: data?.errorMessage || data?.error || "read_failed",
+      value: null,
+    };
+  }
+
+  const raw = data?.data?.Data?.[PLAYER_ORDER_STATUS_DATA_KEY]?.Value;
+  if (!raw) {
+    return { error: null, value: { order_statuses: [] } };
+  }
+
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed?.order_statuses)) {
+      return { error: "invalid_shape", value: { order_statuses: [] }, raw };
+    }
+    return { error: null, value: parsed };
+  } catch {
+    return { error: "invalid_json", value: { order_statuses: [] }, raw };
+  }
 }
 
-function buildRegistryEntry(event, ownerPlayFabId) {
-  const status = event.notificationType || "UNKNOWN";
+function buildOrderStatusEntry(event) {
   return {
-    ownerMetaId: event.userId ? String(event.userId) : null,
-    ownerPlayFabId: ownerPlayFabId ?? null,
     sku: event.sku ?? null,
-    purchasedAt: event.eventTime ? Number(event.eventTime) : null,
-    status,
-    notificationType: event.notificationType ?? null,
-    developerPayload: normalizeDeveloperPayload(event.developerPayload),
-    webhookReceivedAt: new Date().toISOString(),
-    grantedToPlayFabId: null,
-    grantedAt: null,
+    reporting_id: event.reportingId ?? null,
   };
 }
 
-async function processRegistryDryRun(event) {
-  if (!event.reportingId) {
-    log("warn", "registry-dry-run", "Skipping — event has no reportingId", {
-      sku: event.sku,
-      userId: event.userId,
-    });
+function mergeOrderStatusData(current, entry) {
+  const orderStatuses = [...(current?.order_statuses ?? [])];
+  const duplicate = orderStatuses.some(
+    (row) => row.reporting_id === entry.reporting_id,
+  );
+
+  if (duplicate) {
+    return { merged: current, action: "skip_duplicate" };
+  }
+
+  orderStatuses.push(entry);
+  return {
+    merged: { order_statuses: orderStatuses },
+    action: "append",
+  };
+}
+
+async function processOrderStatusDryRun(event) {
+  if (isIgnoredConsumableSku(event.sku)) {
+    log(
+      "info",
+      "order-status-dry-run",
+      "Skipping consumable SKU — not tracked",
+      {
+        sku: event.sku,
+        reportingId: event.reportingId,
+      },
+    );
+    return;
+  }
+
+  if (!event.reportingId || !event.sku) {
+    log(
+      "warn",
+      "order-status-dry-run",
+      "Skipping — missing reportingId or sku",
+      {
+        reportingId: event.reportingId,
+        sku: event.sku,
+      },
+    );
+    return;
+  }
+
+  if (event.notificationType !== "PURCHASED") {
+    log(
+      "info",
+      "order-status-dry-run",
+      "Skipping — only PURCHASED handled for now",
+      {
+        notificationType: event.notificationType,
+        reportingId: event.reportingId,
+      },
+    );
     return;
   }
 
   const titleId = process.env.PLAYFAB_TITLE_ID;
   const secretKey = process.env.PLAYFAB_DEV_SECRET_KEY;
-  const writeEnabled = process.env.META_IAP_REGISTRY_WRITE === "1";
+  const writeEnabled = process.env.META_IAP_ORDER_STATUS_WRITE === "1";
 
   let buyer = null;
   if (titleId && secretKey && event.userId) {
@@ -179,40 +259,110 @@ async function processRegistryDryRun(event) {
         metaId: event.userId,
         error: err.message,
       });
+      return;
     }
   } else if (event.userId) {
     log(
       "warn",
       "playfab-lookup",
-      "Skipping lookup — PLAYFAB_TITLE_ID or PLAYFAB_DEV_SECRET_KEY not configured",
+      "Skipping — PLAYFAB_TITLE_ID or PLAYFAB_DEV_SECRET_KEY not configured",
     );
+    return;
   }
 
-  const registryEntry = buildRegistryEntry(event, buyer?.playFabId ?? null);
+  if (!buyer?.playFabId) {
+    log(
+      "info",
+      "order-status-dry-run",
+      "Would write after first login — no PlayFab account yet",
+      {
+        metaId: event.userId,
+        reportingId: event.reportingId,
+        sku: event.sku,
+        entry: buildOrderStatusEntry(event),
+      },
+    );
+    return;
+  }
 
-  // Title Internal Data is title-wide (not per-player UserData). Keyed by reporting_id inside the blob.
+  let currentRead = { value: { order_statuses: [] } };
+  try {
+    currentRead = await getPlayerOrderStatusData(
+      buyer.playFabId,
+      titleId,
+      secretKey,
+    );
+    if (
+      currentRead.error &&
+      currentRead.error !== "invalid_shape" &&
+      currentRead.error !== "invalid_json"
+    ) {
+      log(
+        "error",
+        "order-status-dry-run",
+        "Failed to read existing Read Only Data",
+        {
+          playFabId: buyer.playFabId,
+          error: currentRead.error,
+        },
+      );
+      return;
+    }
+    if (
+      currentRead.error === "invalid_shape" ||
+      currentRead.error === "invalid_json"
+    ) {
+      log(
+        "warn",
+        "order-status-dry-run",
+        "Existing key has unexpected shape — would reset list on write",
+        {
+          playFabId: buyer.playFabId,
+          raw: currentRead.raw,
+        },
+      );
+    }
+  } catch (err) {
+    log(
+      "error",
+      "order-status-dry-run",
+      "Read existing PlayerOrderStatusData failed",
+      {
+        playFabId: buyer.playFabId,
+        error: err.message,
+      },
+    );
+    return;
+  }
+
+  const entry = buildOrderStatusEntry(event);
+  const { merged, action } = mergeOrderStatusData(currentRead.value, entry);
+
   const wouldWrite = {
     dryRun: !writeEnabled,
-    writeTarget: "TitleInternalData",
-    api: "Admin/SetTitleInternalData",
-    key: REGISTRY_TITLE_INTERNAL_KEY,
-    upsert: {
-      [event.reportingId]: registryEntry,
-    },
+    writeTarget: "UserReadOnlyData",
+    api: "Server/UpdateUserReadOnlyData",
+    playFabId: buyer.playFabId,
+    displayName: buyer.profile?.displayName ?? null,
+    key: PLAYER_ORDER_STATUS_DATA_KEY,
+    action,
+    currentValue: currentRead.value,
+    mergedValue: merged,
+    newEntry: entry,
   };
 
   log(
     "info",
-    "registry-dry-run",
-    "Would upsert IAP ownership registry entry",
+    "order-status-dry-run",
+    "Would update player IAP order statuses",
     wouldWrite,
   );
 
   if (writeEnabled) {
     log(
       "warn",
-      "registry-dry-run",
-      "META_IAP_REGISTRY_WRITE=1 but persist is not implemented yet — no PlayFab write performed",
+      "order-status-dry-run",
+      "META_IAP_ORDER_STATUS_WRITE=1 but persist is not implemented yet — no PlayFab write performed",
     );
   }
 }
@@ -436,11 +586,11 @@ async function handleEventNotification(req, res) {
     for (const event of orderEvents) {
       log("info", "order_status", "Order event received", event);
       try {
-        await processRegistryDryRun(event);
+        await processOrderStatusDryRun(event);
       } catch (err) {
         log(
           "error",
-          "registry-dry-run",
+          "order-status-dry-run",
           "Unexpected error during dry-run processing",
           {
             reportingId: event.reportingId,
