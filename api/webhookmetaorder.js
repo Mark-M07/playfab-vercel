@@ -8,12 +8,13 @@ import fetch from "node-fetch";
  * Required env vars:
  *    META_WEBHOOK_VERIFY_TOKEN   - must match the "Verify token" field on the dashboard-created webhook
  *                                - see -> https://developers.meta.com/horizon/manage/applications/8485526434899813/platform-services/webhooks/
+ *    META_WEBHOOK_BLOCK_WRITES   - set to "1" to block PlayFab writes but keep Vercel logging
+ *    PLAYFAB_TITLE_ID            - required for buyer PlayFab lookup + writes
+ *    PLAYFAB_DEV_SECRET_KEY      - required for buyer PlayFab lookup + writes
  *
- * Phase 2 (order status ownership) env vars:
- *    PLAYFAB_TITLE_ID              - required for buyer PlayFab lookup + writes
- *    PLAYFAB_DEV_SECRET_KEY        - required for buyer PlayFab lookup + writes
- *    META_IAP_ORDER_STATUS_WRITE   - set to "1" to write to PlayFab, otherwise, it's a dry-run
-
+ * Live writes are ON by default for all PURCHASED durable events (consumable Nugs SKUs excluded).
+ *
+ * Live write test whitelist (logging only — same write path as all players):
  *    28914815224829230 (Conehead91), 9062660193814011 (Ogethel)
  *
  * Meta dashboard test mode (no env var required):
@@ -32,8 +33,8 @@ import fetch from "node-fetch";
  *    Search "[META_WEBHOOK][playfab-lookup]" for Meta ID → PlayFab profile resolution
  *    Search "[META_WEBHOOK][dashboard-test]" for Meta dashboard test payload overrides
  *    Search "[META_WEBHOOK][live-write-test]" for whitelisted Meta IDs with live writes
- *    Search "[META_WEBHOOK][order-status-dry-run]" for Read Only Data writes that would occur
- *    Search "[META_WEBHOOK][order-status-write]" for live Read Only Data writes (dashboard test user only)
+ *    Search "[META_WEBHOOK][order-status-dry-run]" for would-write logs when META_WEBHOOK_BLOCK_WRITES != 1
+ *    Search "[META_WEBHOOK][order-status-write]" for live Read Only Data writes
  *
  * @route GET|POST /api/webhookmetaorder
  */
@@ -82,12 +83,12 @@ function isLiveWriteTestUser(metaId) {
   return LIVE_WRITE_TEST_META_IDS.has(String(metaId));
 }
 
-function shouldWriteOrderStatus(event) {
-  return (
-    Boolean(event.isDashboardTest) ||
-    isLiveWriteTestUser(event.userId) ||
-    process.env.META_IAP_ORDER_STATUS_WRITE === "1"
-  );
+function shouldWriteOrderStatus() {
+  return process.env.META_WEBHOOK_BLOCK_WRITES !== "1";
+}
+
+function orderStatusLogTag(writeEnabled) {
+  return writeEnabled ? "order-status-write" : "order-status-dry-run";
 }
 
 function pickRandomDashboardTestSku() {
@@ -365,7 +366,7 @@ async function processOrderStatusEvent(event) {
 
   const titleId = process.env.PLAYFAB_TITLE_ID;
   const secretKey = process.env.PLAYFAB_DEV_SECRET_KEY;
-  const writeEnabled = shouldWriteOrderStatus(event);
+  const writeEnabled = shouldWriteOrderStatus();
 
   let buyer = null;
   if (titleId && secretKey && event.userId) {
@@ -391,8 +392,10 @@ async function processOrderStatusEvent(event) {
   if (!buyer?.playFabId) {
     log(
       "info",
-      "order-status-dry-run",
-      "Would write after first login — no PlayFab account yet",
+      orderStatusLogTag(writeEnabled),
+      writeEnabled
+        ? "Deferred — no PlayFab account yet (will not write until buyer logs in)"
+        : "Would write after first login — no PlayFab account yet",
       {
         metaId: event.userId,
         reportingId: event.reportingId,
@@ -471,7 +474,7 @@ async function processOrderStatusEvent(event) {
 
   log(
     "info",
-    writeEnabled ? "order-status-write" : "order-status-dry-run",
+    orderStatusLogTag(writeEnabled),
     writeEnabled
       ? "Updating player IAP order statuses"
       : "Would update player IAP order statuses",
