@@ -30,10 +30,12 @@ import fetch from "node-fetch";
  *    Search "[META_WEBHOOK]" for all webhook traffic
  *    Search "[META_WEBHOOK][order_status]" for purchase/refund events only
  *    Search "[META_WEBHOOK][verification]" for Meta dashboard setup / re-verification GETs
- *    Search "[META_WEBHOOK][playfab-lookup]" for Meta ID → PlayFab profile resolution
+ *    Search "[META_WEBHOOK][playfab-lookup]" for successful Meta ID → PlayFab resolution
+ *    Search "[META_WEBHOOK][orphan-purchaser]" for valid Meta ID, PlayFab OK, no linked account (pre-login store purchase)
+ *    Search "[META_WEBHOOK][lookup-invalid-meta-id]" for bad webhook user_id (e.g. "0")
+ *    Search "[META_WEBHOOK][lookup-playfab-error]" for PlayFab API errors (non-transient)
+ *    Search "[META_WEBHOOK][lookup-transient]" for retryable PlayFab failures (5xx/429)
  *    Search "[META_WEBHOOK][dashboard-test]" for Meta dashboard test payload overrides
- *    Search "[META_WEBHOOK][live-write-test]" for whitelisted Meta IDs with live writes
- *    Search "[META_WEBHOOK][order-status-dry-run]" for would-write logs when META_WEBHOOK_BLOCK_WRITES != 1
  *    Search "[META_WEBHOOK][order-status-write]" for live Read Only Data writes
  *
  * @route GET|POST /api/webhookmetaorder
@@ -139,13 +141,89 @@ function logLiveWriteTestUser(event) {
     return event;
   }
 
-  log("info", "live-write-test", "Whitelisted Meta ID — will write PlayerOrderStatusData", {
-    metaId: event.userId,
-    sku: event.sku,
-    reportingId: event.reportingId,
-  });
+  log(
+    "info",
+    "live-write-test",
+    "Whitelisted Meta ID — will write PlayerOrderStatusData",
+    {
+      metaId: event.userId,
+      sku: event.sku,
+      reportingId: event.reportingId,
+    },
+  );
 
   return { ...event, isLiveWriteTest: true };
+}
+
+/** PlayFab lookup failed with HTTP 429/5xx — retry may succeed on Meta webhook redelivery. */
+const TRANSIENT_HTTP_STATUSES = new Set([429, 500, 502, 503, 504]);
+
+function isValidMetaUserId(metaId) {
+  const s = String(metaId ?? "").trim();
+  if (!s || s === "0") return false;
+  // Meta Quest app-scoped user IDs are numeric strings (typically ~10–17 digits).
+  return /^\d{5,20}$/.test(s);
+}
+
+function describeInvalidMetaUserId(metaId) {
+  const s = String(metaId ?? "").trim();
+  if (!s) return "user_id is empty";
+  if (s === "0") {
+    return 'user_id is "0" (Meta placeholder — not a real profile; cannot map to PlayFab)';
+  }
+  if (!/^\d+$/.test(s)) return "user_id is not numeric";
+  if (s.length < 5) return "user_id is too short for a Meta app-scoped ID";
+  if (s.length > 20) return "user_id is too long for a Meta app-scoped ID";
+  return "user_id failed validation";
+}
+
+function classifyPlayFabLookup(metaId, lookup) {
+  if (!isValidMetaUserId(metaId)) {
+    return {
+      outcome: "invalid_meta_id",
+      logTag: "lookup-invalid-meta-id",
+      message: describeInvalidMetaUserId(metaId),
+    };
+  }
+
+  if (!lookup.apiOk) {
+    const msg = lookup.errorMessage || "lookup_failed";
+    if (TRANSIENT_HTTP_STATUSES.has(lookup.httpStatus)) {
+      return {
+        outcome: "transient_error",
+        logTag: "lookup-transient",
+        message: `PlayFab transient error (HTTP ${lookup.httpStatus}): ${msg}`,
+      };
+    }
+    const lower = msg.toLowerCase();
+    if (lower.includes("invalid input")) {
+      return {
+        outcome: "invalid_meta_id",
+        logTag: "lookup-invalid-meta-id",
+        message: `PlayFab rejected user_id lookup: ${msg}`,
+      };
+    }
+    return {
+      outcome: "playfab_api_error",
+      logTag: "lookup-playfab-error",
+      message: `PlayFab API error (HTTP ${lookup.httpStatus ?? "?"}): ${msg}`,
+    };
+  }
+
+  if (!lookup.playFabId) {
+    return {
+      outcome: "pre_login_purchaser",
+      logTag: "orphan-purchaser",
+      message:
+        "PlayFab OK — CustomId not linked (buyer purchased before first login / account auto-create)",
+    };
+  }
+
+  return {
+    outcome: "success",
+    logTag: "playfab-lookup",
+    message: "PlayFab account resolved",
+  };
 }
 
 /** Plain fetch to PlayFab — no DoH pinning (see rotatetoken.js). */
@@ -163,7 +241,18 @@ async function playFabApi(path, titleId, secretKey, body) {
 }
 
 async function getPlayFabIdFromMetaId(metaId, titleId, secretKey) {
-  const { ok, data } = await playFabApi(
+  if (!isValidMetaUserId(metaId)) {
+    return {
+      playFabId: null,
+      apiOk: false,
+      httpStatus: null,
+      errorMessage: describeInvalidMetaUserId(metaId),
+      errorCode: null,
+      skippedApiCall: true,
+    };
+  }
+
+  const { ok, status, data } = await playFabApi(
     "/Server/GetPlayFabIDsFromGenericIDs",
     titleId,
     secretKey,
@@ -175,12 +264,23 @@ async function getPlayFabIdFromMetaId(metaId, titleId, secretKey) {
   if (!ok) {
     return {
       playFabId: null,
-      error: data?.errorMessage || data?.error || "lookup_failed",
+      apiOk: false,
+      httpStatus: status,
+      errorMessage: data?.errorMessage || data?.error || "lookup_failed",
+      errorCode: data?.errorCode ?? null,
+      skippedApiCall: false,
     };
   }
 
   const playFabId = data?.data?.Data?.[0]?.PlayFabId ?? null;
-  return { playFabId, error: playFabId ? null : "no_playfab_account" };
+  return {
+    playFabId,
+    apiOk: true,
+    httpStatus: status,
+    errorMessage: playFabId ? null : "no_playfab_account",
+    errorCode: null,
+    skippedApiCall: false,
+  };
 }
 
 async function getPlayerProfileSummary(playFabId, titleId, secretKey) {
@@ -214,13 +314,24 @@ async function getPlayerProfileSummary(playFabId, titleId, secretKey) {
 
 async function lookupBuyerPlayFabProfile(metaId, titleId, secretKey) {
   const lookup = await getPlayFabIdFromMetaId(metaId, titleId, secretKey);
+  const classification = classifyPlayFabLookup(metaId, lookup);
+
+  const base = {
+    metaId: String(metaId),
+    playFabId: lookup.playFabId,
+    outcome: classification.outcome,
+    logTag: classification.logTag,
+    detail: classification.message,
+    httpStatus: lookup.httpStatus,
+    playFabErrorCode: lookup.errorCode,
+    skippedApiCall: lookup.skippedApiCall ?? false,
+  };
 
   if (!lookup.playFabId) {
     return {
-      metaId: String(metaId),
-      playFabId: null,
+      ...base,
       accountExists: false,
-      lookupError: lookup.error,
+      lookupError: lookup.errorMessage,
       profile: null,
     };
   }
@@ -232,8 +343,7 @@ async function lookupBuyerPlayFabProfile(metaId, titleId, secretKey) {
   );
 
   return {
-    metaId: String(metaId),
-    playFabId: lookup.playFabId,
+    ...base,
     accountExists: true,
     lookupError: profile.error ?? null,
     profile: profile.error
@@ -244,6 +354,49 @@ async function lookupBuyerPlayFabProfile(metaId, titleId, secretKey) {
           lastLogin: profile.lastLogin,
         },
   };
+}
+
+function logUnresolvedLookup(event, buyer, writeEnabled) {
+  if (!buyer) {
+    log("error", "lookup-playfab-error", "Lookup result missing", {
+      metaId: event.userId,
+      sku: event.sku,
+      reportingId: event.reportingId,
+    });
+    return;
+  }
+
+  const level =
+    buyer.outcome === "transient_error"
+      ? "warn"
+      : buyer.outcome === "pre_login_purchaser"
+        ? "info"
+        : "error";
+
+  const payload = {
+    outcome: buyer.outcome,
+    metaId: event.userId,
+    sku: event.sku,
+    reportingId: event.reportingId,
+    httpStatus: buyer.httpStatus,
+    playFabErrorCode: buyer.playFabErrorCode,
+    lookupError: buyer.lookupError,
+    skippedApiCall: buyer.skippedApiCall,
+    entry: buildOrderStatusEntry(event),
+    writesBlocked: !writeEnabled,
+  };
+
+  if (buyer.outcome === "pre_login_purchaser") {
+    log(
+      level,
+      "orphan-purchaser",
+      "Pre-login purchaser — no PlayFab CustomId yet; store externally until first login",
+      payload,
+    );
+    return;
+  }
+
+  log(level, buyer.logTag, buyer.detail, payload);
 }
 
 async function getPlayerOrderStatusData(playFabId, titleId, secretKey) {
@@ -304,7 +457,12 @@ function mergeOrderStatusData(current, entry) {
   };
 }
 
-async function writePlayerOrderStatusData(playFabId, value, titleId, secretKey) {
+async function writePlayerOrderStatusData(
+  playFabId,
+  value,
+  titleId,
+  secretKey,
+) {
   const { ok, data } = await playFabApi(
     "/Server/UpdateUserReadOnlyData",
     titleId,
@@ -364,6 +522,21 @@ async function processOrderStatusEvent(event) {
     return;
   }
 
+  if (!isValidMetaUserId(event.userId)) {
+    log(
+      "error",
+      "lookup-invalid-meta-id",
+      describeInvalidMetaUserId(event.userId),
+      {
+        metaId: event.userId,
+        sku: event.sku,
+        reportingId: event.reportingId,
+        appId: event.appId,
+      },
+    );
+    return;
+  }
+
   const titleId = process.env.PLAYFAB_TITLE_ID;
   const secretKey = process.env.PLAYFAB_DEV_SECRET_KEY;
   const writeEnabled = shouldWriteOrderStatus();
@@ -372,10 +545,14 @@ async function processOrderStatusEvent(event) {
   if (titleId && secretKey && event.userId) {
     try {
       buyer = await lookupBuyerPlayFabProfile(event.userId, titleId, secretKey);
-      log("info", "playfab-lookup", "Buyer profile lookup", buyer);
+      if (buyer.playFabId) {
+        log("info", "playfab-lookup", "Buyer profile lookup succeeded", buyer);
+      }
     } catch (err) {
-      log("error", "playfab-lookup", "Buyer profile lookup failed", {
+      log("error", "lookup-playfab-error", "Buyer profile lookup threw", {
         metaId: event.userId,
+        sku: event.sku,
+        reportingId: event.reportingId,
         error: err.message,
       });
       return;
@@ -390,19 +567,7 @@ async function processOrderStatusEvent(event) {
   }
 
   if (!buyer?.playFabId) {
-    log(
-      "info",
-      orderStatusLogTag(writeEnabled),
-      writeEnabled
-        ? "Deferred — no PlayFab account yet (will not write until buyer logs in)"
-        : "Would write after first login — no PlayFab account yet",
-      {
-        metaId: event.userId,
-        reportingId: event.reportingId,
-        sku: event.sku,
-        entry: buildOrderStatusEntry(event),
-      },
-    );
+    logUnresolvedLookup(event, buyer, writeEnabled);
     return;
   }
 
@@ -491,30 +656,50 @@ async function processOrderStatusEvent(event) {
       );
 
       if (writeResult.ok) {
-        log("info", "order-status-write", "PlayerOrderStatusData write succeeded", {
-          playFabId: buyer.playFabId,
-          displayName: buyer.profile?.displayName ?? null,
-          key: PLAYER_ORDER_STATUS_DATA_KEY,
-          mergedValue: merged,
-        });
+        log(
+          "info",
+          "order-status-write",
+          "PlayerOrderStatusData write succeeded",
+          {
+            playFabId: buyer.playFabId,
+            displayName: buyer.profile?.displayName ?? null,
+            key: PLAYER_ORDER_STATUS_DATA_KEY,
+            mergedValue: merged,
+          },
+        );
       } else {
-        log("error", "order-status-write", "PlayerOrderStatusData write failed", {
-          playFabId: buyer.playFabId,
-          error: writeResult.error,
-          mergedValue: merged,
-        });
+        log(
+          "error",
+          "order-status-write",
+          "PlayerOrderStatusData write failed",
+          {
+            playFabId: buyer.playFabId,
+            error: writeResult.error,
+            mergedValue: merged,
+          },
+        );
       }
     } catch (err) {
-      log("error", "order-status-write", "PlayerOrderStatusData write exception", {
-        playFabId: buyer.playFabId,
-        error: err.message,
-      });
+      log(
+        "error",
+        "order-status-write",
+        "PlayerOrderStatusData write exception",
+        {
+          playFabId: buyer.playFabId,
+          error: err.message,
+        },
+      );
     }
   } else if (writeEnabled && action === "skip_duplicate") {
-    log("info", "order-status-write", "Write skipped — duplicate reporting_id", {
-      playFabId: buyer.playFabId,
-      reportingId: entry.reporting_id,
-    });
+    log(
+      "info",
+      "order-status-write",
+      "Write skipped — duplicate reporting_id",
+      {
+        playFabId: buyer.playFabId,
+        reportingId: entry.reporting_id,
+      },
+    );
   }
 }
 
