@@ -1,5 +1,7 @@
 import crypto from "crypto";
 import fetch from "node-fetch";
+import { ensurePlayerByOculusId } from "../lib/supabase/players.js";
+import { isSupabaseConfigured } from "../lib/supabase/client.js";
 
 /**
  * Meta webhook receiver for IAP order_status event.
@@ -20,8 +22,11 @@ import fetch from "node-fetch";
  * Meta dashboard test mode (no env var required):
  *    user_id 10149999707612630 → 28914815224829230 (Conehead91), item_sku_1 → random durable bundle SKU,
  *    always writes PlayerOrderStatusData to the target account for testing purposes
+ *    (jk, right now we are skipping calls to playfab on this user so I can test orphaned-user calls to Supabase)
  *
  * Optional env vars:
+ *   SUPABASE_URL                 - Supabase project URL
+ *   SUPABASE_SERVICE_ROLE_KEY    - service role key (server only, never in client APK)
  *   OCULUS_APP_SECRET            - used to validate against the signed SHA256 Meta sends in their payload's X-Hub-Signature-256 header
  *                                - see -> https://developers.facebook.com/docs/graph-api/webhooks/getting-started#validate-requests
  *   META_WEBHOOK_SKIP_SIGNATURE  - set to "1" to log signature mismatches but still accept events (testing only)
@@ -32,6 +37,8 @@ import fetch from "node-fetch";
  *    Search "[META_WEBHOOK][verification]" for Meta dashboard setup / re-verification GETs
  *    Search "[META_WEBHOOK][playfab-lookup]" for successful Meta ID → PlayFab resolution
  *    Search "[META_WEBHOOK][orphan-purchaser]" for valid Meta ID, PlayFab OK, no linked account (pre-login store purchase)
+ *    Search "[META_WEBHOOK][supabase-players]" for ug.players registry get/insert on orphan flow
+ *    Search "[META_WEBHOOK][orphan-test]" for forced orphan QA path (skips PlayFab)
  *    Search "[META_WEBHOOK][lookup-invalid-meta-id]" for bad webhook user_id (e.g. "0")
  *    Search "[META_WEBHOOK][lookup-playfab-error]" for PlayFab API errors (non-transient)
  *    Search "[META_WEBHOOK][lookup-transient]" for retryable PlayFab failures (5xx/429)
@@ -60,6 +67,11 @@ const IGNORED_CONSUMABLE_SKUS = new Set([
 const META_DASHBOARD_TEST_META_ID = "10149999707612630";
 const META_DASHBOARD_TEST_TARGET_META_ID = "28914815224829230";
 const META_DASHBOARD_TEST_SKU = "item_sku_1";
+/** TEMP: Skip PlayFab lookup and run orphan + Supabase path*/
+const FORCED_ORPHAN_TEST_META_IDS = new Set([
+  META_DASHBOARD_TEST_META_ID,
+  META_DASHBOARD_TEST_TARGET_META_ID,
+]);
 const DASHBOARD_TEST_DURABLE_SKUS = [
   "Bundle_HammerHug",
   "Bundle_WaveRider",
@@ -83,6 +95,27 @@ function isMetaDashboardTestUser(metaId) {
 
 function isLiveWriteTestUser(metaId) {
   return LIVE_WRITE_TEST_META_IDS.has(String(metaId));
+}
+
+function isForcedOrphanTestUser(metaId) {
+  return FORCED_ORPHAN_TEST_META_IDS.has(String(metaId));
+}
+
+function buildForcedOrphanTestBuyer(metaId) {
+  return {
+    metaId: String(metaId),
+    playFabId: null,
+    accountExists: false,
+    outcome: "pre_login_purchaser",
+    logTag: "orphan-purchaser",
+    detail: "Forced orphan test — PlayFab lookup skipped",
+    lookupError: null,
+    profile: null,
+    httpStatus: null,
+    playFabErrorCode: null,
+    skippedApiCall: true,
+    forcedOrphanTest: true,
+  };
 }
 
 function shouldWriteOrderStatus() {
@@ -113,7 +146,6 @@ function applyDashboardTestOverrides(event) {
 
   const translated = {
     ...event,
-    userId: META_DASHBOARD_TEST_TARGET_META_ID,
     isDashboardTest: true,
   };
 
@@ -390,13 +422,78 @@ function logUnresolvedLookup(event, buyer, writeEnabled) {
     log(
       level,
       "orphan-purchaser",
-      "Pre-login purchaser — no PlayFab CustomId yet; store externally until first login",
+      "Pre-login purchaser — no PlayFab CustomId yet; Supabase ug.players step runs next",
       payload,
     );
     return;
   }
 
   log(level, buyer.logTag, buyer.detail, payload);
+}
+
+async function ensureOrphanPlayerInSupabase(event) {
+  if (!isSupabaseConfigured()) {
+    log(
+      "warn",
+      "supabase-players",
+      "Supabase env not configured - skipping ug.players",
+      {
+        metaId: event.userId,
+        reportingId: event.reportingId,
+        sku: event.sku,
+      },
+    );
+    return null;
+  }
+
+  try {
+    const result = await ensurePlayerByOculusId(event.userId);
+
+    if (!result.ok || !result.player) {
+      log(
+        "error",
+        "supabase-players",
+        "Failed to ensure player in ug.players",
+        {
+          metaId: event.userId,
+          reportingId: event.reportingId,
+          sku: event.sku,
+          error: result.error,
+          code: result.code,
+        },
+      );
+      return null;
+    }
+
+    log(
+      "info",
+      "supabase-players",
+      result.created
+        ? "Inserted new row in ug.players"
+        : "Player already exists in ug.players",
+      {
+        metaId: event.userId,
+        supabasePlayerId: result.player.id,
+        created: result.created,
+        reportingId: event.reportingId,
+        sku: event.sku,
+      },
+    );
+
+    return result.player;
+  } catch (err) {
+    log(
+      "error",
+      "supabase-players",
+      "Unexpected error ensuring ug.players row",
+      {
+        metaId: event.userId,
+        reportingId: event.reportingId,
+        error: err.message,
+      },
+    );
+    return null;
+  }
 }
 
 async function getPlayerOrderStatusData(playFabId, titleId, secretKey) {
@@ -541,6 +638,26 @@ async function processOrderStatusEvent(event) {
   const secretKey = process.env.PLAYFAB_DEV_SECRET_KEY;
   const writeEnabled = shouldWriteOrderStatus();
 
+  if (isForcedOrphanTestUser(event.userId)) {
+    log(
+      "info",
+      "orphan-test",
+      "Forcing pre-login orphan path — skipping PlayFab lookup",
+      {
+        metaId: event.userId,
+        sku: event.sku,
+        reportingId: event.reportingId,
+      },
+    );
+    await ensureOrphanPlayerInSupabase(event);
+    logUnresolvedLookup(
+      event,
+      buildForcedOrphanTestBuyer(event.userId),
+      writeEnabled,
+    );
+    return;
+  }
+
   let buyer = null;
   if (titleId && secretKey && event.userId) {
     try {
@@ -567,6 +684,9 @@ async function processOrderStatusEvent(event) {
   }
 
   if (!buyer?.playFabId) {
+    if (buyer?.outcome === "pre_login_purchaser") {
+      await ensureOrphanPlayerInSupabase(event);
+    }
     logUnresolvedLookup(event, buyer, writeEnabled);
     return;
   }
