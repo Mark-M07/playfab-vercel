@@ -1,6 +1,10 @@
 import crypto from "crypto";
 import fetch from "node-fetch";
 import { ensurePlayerByOculusId } from "../lib/supabase/players.js";
+import {
+  parseMetaEventTime,
+  recordOrderStatus,
+} from "../lib/supabase/iap-order-status.js";
 import { isSupabaseConfigured } from "../lib/supabase/client.js";
 
 /**
@@ -38,6 +42,7 @@ import { isSupabaseConfigured } from "../lib/supabase/client.js";
  *    Search "[META_WEBHOOK][playfab-lookup]" for successful Meta ID → PlayFab resolution
  *    Search "[META_WEBHOOK][orphan-purchaser]" for valid Meta ID, PlayFab OK, no linked account (pre-login store purchase)
  *    Search "[META_WEBHOOK][supabase-players]" for ug.players registry get/insert on orphan flow
+ *    Search "[META_WEBHOOK][supabase-iap-order-status]" for ug.iap_order_status insert on orphan flow
  *    Search "[META_WEBHOOK][orphan-test]" for forced orphan QA path (skips PlayFab)
  *    Search "[META_WEBHOOK][lookup-invalid-meta-id]" for bad webhook user_id (e.g. "0")
  *    Search "[META_WEBHOOK][lookup-playfab-error]" for PlayFab API errors (non-transient)
@@ -422,13 +427,94 @@ function logUnresolvedLookup(event, buyer, writeEnabled) {
     log(
       level,
       "orphan-purchaser",
-      "Pre-login purchaser — no PlayFab CustomId yet; Supabase ug.players step runs next",
+      "Pre-login purchaser — no PlayFab CustomId yet; Supabase ug.players + ug.iap_order_status steps run next",
       payload,
     );
     return;
   }
 
   log(level, buyer.logTag, buyer.detail, payload);
+}
+
+async function recordOrphanOrderStatusInSupabase(event, player) {
+  if (!isSupabaseConfigured()) {
+    log(
+      "warn",
+      "supabase-iap-order-status",
+      "Supabase env not configured - skipping ug.iap_order_status",
+      {
+        metaId: event.userId,
+        reportingId: event.reportingId,
+        sku: event.sku,
+        supabasePlayerId: player.id,
+      },
+    );
+    return null;
+  }
+
+  try {
+    const result = await recordOrderStatus({
+      reportingId: event.reportingId,
+      sku: event.sku,
+      oculusId: event.userId,
+      playerId: player.id,
+      notificationType: event.notificationType,
+      purchasedAt: parseMetaEventTime(event.eventTime),
+    });
+
+    if (!result.ok || !result.orderStatus) {
+      log(
+        "error",
+        "supabase-iap-order-status",
+        "Failed to record order in ug.iap_order_status",
+        {
+          metaId: event.userId,
+          reportingId: event.reportingId,
+          sku: event.sku,
+          supabasePlayerId: player.id,
+          error: result.error,
+          code: result.code,
+          action: result.action,
+        },
+      );
+      return null;
+    }
+
+    const message =
+      result.action === "skip_duplicate"
+        ? "Order already recorded in ug.iap_order_status"
+        : result.created
+          ? "Inserted new row in ug.iap_order_status"
+          : "Recorded order in ug.iap_order_status";
+
+    log("info", "supabase-iap-order-status", message, {
+      metaId: event.userId,
+      reportingId: event.reportingId,
+      sku: event.sku,
+      supabasePlayerId: player.id,
+      supabaseOrderStatusId: result.orderStatus.id,
+      notificationType: event.notificationType,
+      purchasedAt: result.orderStatus.purchased_at,
+      created: result.created,
+      action: result.action,
+    });
+
+    return result.orderStatus;
+  } catch (err) {
+    log(
+      "error",
+      "supabase-iap-order-status",
+      "Unexpected error recording ug.iap_order_status row",
+      {
+        metaId: event.userId,
+        reportingId: event.reportingId,
+        sku: event.sku,
+        supabasePlayerId: player.id,
+        error: err.message,
+      },
+    );
+    return null;
+  }
 }
 
 async function ensureOrphanPlayerInSupabase(event) {
@@ -479,6 +565,8 @@ async function ensureOrphanPlayerInSupabase(event) {
         sku: event.sku,
       },
     );
+
+    await recordOrphanOrderStatusInSupabase(event, result.player);
 
     return result.player;
   } catch (err) {
